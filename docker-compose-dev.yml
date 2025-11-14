@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  # 开发环境 - 电商业务实例
+  faiss-ecommerce-dev:
+    build: .
+    ports:
+      - "8002:8000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - .:/app  # 开发模式挂载源代码
+    environment:
+      - ENVIRONMENT=development
+      - BUSINESS_ID=ecommerce_dev
+      - SERVICE_NAME=faiss-vector-db-ecommerce-dev
+      - FAISS_INDEX_TYPE=IVFFlat
+      - AUTO_SAVE=false
+      - LOG_LEVEL=DEBUG
+      - BATCH_SIZE=16
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - FAISS_NLIST=50
+      - EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2
+    restart: unless-stopped
+    networks:
+      - faiss-dev-network
+
+  # 开发环境 - 医疗业务实例
+  faiss-medical-dev:
+    build: .
+    ports:
+      - "8003:8000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - .:/app  # 开发模式挂载源代码
+    environment:
+      - ENVIRONMENT=development
+      - BUSINESS_ID=medical_dev
+      - SERVICE_NAME=faiss-vector-db-medical-dev
+      - FAISS_INDEX_TYPE=FlatL2
+      - AUTO_SAVE=false
+      - LOG_LEVEL=DEBUG
+      - BATCH_SIZE=16
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2
+    restart: unless-stopped
+    networks:
+      - faiss-dev-network
+
+networks:
+  faiss-dev-network:
+    driver: bridge

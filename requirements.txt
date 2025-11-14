@@ -1,0 +1,22 @@
+# Core dependencies
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+numpy>=1.24.0
+sentence-transformers>=2.2.0
+
+# FAISS - choose one based on your hardware
+faiss-gpu-cu12>=1.12.0
+
+# Optional dependencies for production
+python-multipart>=0.0.6
+python-json-logger>=2.0.0
+prometheus-client>=0.19.0
+
+# Development dependencies
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+httpx>=0.25.0
+black>=23.0.0
+isort>=5.12.0
+flake8>=6.0.0
