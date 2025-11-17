@@ -1,11 +1,10 @@
-version: '3.8'
 
 services:
   # 默认业务实例
   faiss-default:
     build: .
     ports:
-      - "8001:8000"
+      - "8003:8001"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -13,139 +12,40 @@ services:
       - ENVIRONMENT=production
       - BUSINESS_ID=default
       - SERVICE_NAME=faiss-vector-db-default
-      - FAISS_INDEX_TYPE=FlatIP
+      - FAISS_INDEX_TYPE=HNSW
       - AUTO_SAVE=true
       - LOG_LEVEL=INFO
       - BATCH_SIZE=32
       - API_HOST=0.0.0.0
-      - API_PORT=8000
+      - API_PORT=8001
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health', timeout=5)"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-    networks:
-      - faiss-network
-
-  # 电商业务实例
-  faiss-ecommerce:
-    build: .
-    ports:
-      - "8002:8000"
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-    environment:
-      - ENVIRONMENT=production
-      - BUSINESS_ID=ecommerce
-      - SERVICE_NAME=faiss-vector-db-ecommerce
-      - FAISS_INDEX_TYPE=IVFFlat
-      - AUTO_SAVE=true
-      - LOG_LEVEL=INFO
-      - BATCH_SIZE=32
-      - API_HOST=0.0.0.0
-      - API_PORT=8000
-      - FAISS_NLIST=100
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health', timeout=5)"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-    networks:
-      - faiss-network
-
-  # 医疗业务实例
-  faiss-medical:
-    build: .
-    ports:
-      - "8003:8000"
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-    environment:
-      - ENVIRONMENT=production
-      - BUSINESS_ID=medical
-      - SERVICE_NAME=faiss-vector-db-medical
-      - FAISS_INDEX_TYPE=FlatL2
-      - AUTO_SAVE=true
-      - LOG_LEVEL=INFO
-      - BATCH_SIZE=16
-      - API_HOST=0.0.0.0
-      - API_PORT=8000
-      - EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health', timeout=5)"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-    networks:
-      - faiss-network
-
-  # 金融业务实例
-  faiss-finance:
-    build: .
-    ports:
-      - "8004:8000"
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-    environment:
-      - ENVIRONMENT=production
-      - BUSINESS_ID=finance
-      - SERVICE_NAME=faiss-vector-db-finance
-      - FAISS_INDEX_TYPE=FlatIP
-      - AUTO_SAVE=true
-      - LOG_LEVEL=INFO
-      - BATCH_SIZE=16
-      - API_HOST=0.0.0.0
-      - API_PORT=8000
-      - EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health', timeout=5)"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
     networks:
       - faiss-network
 
   # 文档检索业务实例
-  faiss-document:
-    build: .
-    ports:
-      - "8005:8000"
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-    environment:
-      - ENVIRONMENT=production
-      - BUSINESS_ID=document
-      - SERVICE_NAME=faiss-vector-db-document
-      - FAISS_INDEX_TYPE=IVFFlat
-      - AUTO_SAVE=true
-      - LOG_LEVEL=INFO
-      - BATCH_SIZE=64
-      - API_HOST=0.0.0.0
-      - API_PORT=8000
-      - FAISS_NLIST=200
-      - MAX_CHUNK_SIZE=1000
-      - DEFAULT_CHUNK_SIZE=300
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health', timeout=5)"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-    networks:
-      - faiss-network
+  # faiss-document:
+  #   build: .
+  #   ports:
+  #     - "8004:8001"
+  #   volumes:
+  #     - ./data:/app/data
+  #     - ./logs:/app/logs
+  #   environment:
+  #     - ENVIRONMENT=production
+  #     - BUSINESS_ID=document
+  #     - SERVICE_NAME=faiss-vector-db-document
+  #     - FAISS_INDEX_TYPE=HNSW
+  #     - AUTO_SAVE=true
+  #     - LOG_LEVEL=INFO
+  #     - BATCH_SIZE=64
+  #     - API_HOST=0.0.0.0
+  #     - API_PORT=8001
+  #     - FAISS_NLIST=200
+  #     - MAX_CHUNK_SIZE=1000
+  #     - DEFAULT_CHUNK_SIZE=300
+  #   restart: unless-stopped
+  #   networks:
+  #     - faiss-network
 
 networks:
   faiss-network:

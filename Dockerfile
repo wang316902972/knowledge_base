@@ -29,23 +29,26 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # 复制应用代码
 COPY faiss_server_optimized.py .
 COPY config.py .
+COPY entrypoint.sh .
+COPY healthcheck.sh .
 
 # 创建数据目录和日志目录
 RUN mkdir -p /app/data /app/logs
 
 # 设置文件权限
-RUN chmod +x faiss_server_optimized.py
+RUN chmod +x faiss_server_optimized.py entrypoint.sh healthcheck.sh
 
 # 设置默认环境变量
 ENV BUSINESS_ID=default
 ENV FAISS_DATA_DIR=/app/data
+ENV API_PORT=8001
 
-# 暴露端口
+# 暴露端口 - 所有容器内部都运行在8001，外部映射由docker-compose处理
 EXPOSE 8001
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python -c "import requests; requests.get('http://localhost:8001/health', timeout=5)" || exit 1
+    CMD ./healthcheck.sh
 
 # 启动命令
-CMD ["uvicorn", "faiss_server_optimized:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "1"]
+ENTRYPOINT ["./entrypoint.sh"]

@@ -12,6 +12,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field, validator
 from sentence_transformers import SentenceTransformer
+from config import get_config, Config
+from search_optimization import AdvancedSearchIndex, QualityMetrics
 
 # 配置日志
 logging.basicConfig(
@@ -20,17 +22,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 配置类
-class Config:
-    INDEX_FILE = "knowledge_base.index"
-    METADATA_FILE = "knowledge_base.json"  # 改用JSON替代pickle
-    EMBEDDING_DIM = 384
-    MODEL_NAME = 'paraphrase-multilingual-MiniLM-L12-v2'
-    INDEX_TYPE = "FlatIP"  # 可配置的索引类型
-    MAX_CHUNK_SIZE = 2000
-    MIN_CHUNK_SIZE = 50
-    BATCH_SIZE = 32
-    AUTO_SAVE = False  # 默认不自动保存
 
 # 线程安全的向量数据库类
 class FaissVectorDB:
@@ -42,7 +33,7 @@ class FaissVectorDB:
         self.id_to_chunk: Dict[str, str] = {}
         self.chunk_to_id: Dict[str, str] = {}  # 反向索引用于精确删除
         self.dirty = False  # 标记是否有未保存的更改
-        
+
         self._initialize()
     
     def _initialize(self):
@@ -75,14 +66,23 @@ class FaissVectorDB:
     def _create_index(self):
         """根据配置创建FAISS索引"""
         if self.config.INDEX_TYPE == "FlatIP":
+            logger.info(f"创建 FlatIP 索引，维度: {self.config.EMBEDDING_DIM}")
             return faiss.IndexFlatIP(self.config.EMBEDDING_DIM)
         elif self.config.INDEX_TYPE == "FlatL2":
+            logger.info(f"创建 FlatL2 索引，维度: {self.config.EMBEDDING_DIM}")
             return faiss.IndexFlatL2(self.config.EMBEDDING_DIM)
         elif self.config.INDEX_TYPE == "IVFFlat":
             # IVF索引需要训练
-            nlist = 100  # 聚类数量
+            logger.info(f"创建 IVFFlat 索引，维度: {self.config.EMBEDDING_DIM}, nlist: {self.config.NLIST}")
             quantizer = faiss.IndexFlatL2(self.config.EMBEDDING_DIM)
-            index = faiss.IndexIVFFlat(quantizer, self.config.EMBEDDING_DIM, nlist)
+            index = faiss.IndexIVFFlat(quantizer, self.config.EMBEDDING_DIM, self.config.NLIST)
+            return index
+        elif self.config.INDEX_TYPE == "HNSW":
+            # HNSW索引
+            logger.info(f"创建 HNSW 索引，维度: {self.config.EMBEDDING_DIM}, M: {self.config.M}")
+            index = faiss.IndexHNSWFlat(self.config.EMBEDDING_DIM, self.config.M)
+            index.hnsw.efConstruction = self.config.EF_CONSTRUCTION
+            index.hnsw.efSearch = self.config.EF_SEARCH
             return index
         else:
             logger.warning(f"未知索引类型 {self.config.INDEX_TYPE}，使用默认 FlatIP")
@@ -97,95 +97,188 @@ class FaissVectorDB:
             self.index = self._create_index()
             self.id_to_chunk = {}
             self.chunk_to_id = {}
-    
+
+            # 对于IVF索引，尝试创建初始训练数据
+            if self.config.INDEX_TYPE == "IVFFlat":
+                self._initialize_ivf_index_if_needed()
+
+    def _initialize_ivf_index_if_needed(self):
+        """为IVF索引创建初始训练数据"""
+        try:
+            # 生成一些示例训练向量
+            min_train_size = max(self.config.NLIST * 39, 1000)  # 至少1000个向量用于训练
+            logger.info(f"IVF索引需要至少 {min_train_size} 个训练向量...")
+
+            # 生成随机但逼真的训练向量
+            sample_texts = [
+                "这是一个示例文本，用于训练向量索引。",
+                "机器学习是人工智能的一个重要分支。",
+                "向量数据库可以高效地进行相似性搜索。",
+                "深度学习模型需要大量数据进行训练。",
+                "自然语言处理技术越来越成熟。",
+                "计算机视觉在医疗领域有广泛应用。",
+                "推荐系统使用用户行为数据进行个性化推荐。",
+                "数据挖掘可以发现数据中的隐藏模式。",
+                "云计算提供了弹性的计算资源。",
+                "物联网设备连接着物理世界和数字世界。",
+            ] * (min_train_size // 10 + 1)  # 重复以获得足够的文本
+
+            sample_texts = sample_texts[:min_train_size]
+            logger.info(f"生成 {len(sample_texts)} 个样本向量用于IVF索引训练...")
+
+            # 生成嵌入向量
+            train_embeddings = self.embedding_model.encode(
+                sample_texts,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+                normalize_embeddings=True,
+                batch_size=self.config.BATCH_SIZE
+            )
+
+            # 训练索引
+            self.index.train(train_embeddings)
+            logger.info(f"IVF索引训练完成，使用了 {len(train_embeddings)} 个向量")
+
+        except Exception as e:
+            logger.warning(f"IVF索引初始化训练失败: {e}")
+            logger.info("切换到FlatIP索引以避免训练问题...")
+            # 回退到简单的FlatIP索引
+            self.index = faiss.IndexFlatIP(self.config.EMBEDDING_DIM)
+
     def _generate_chunks(self, content: str, chunk_size: int, chunk_overlap: int) -> List[str]:
-        """改进的文本分块逻辑"""
+        """改进的文本分块逻辑 - 支持传统和语义分块"""
         if chunk_size > self.config.MAX_CHUNK_SIZE:
             chunk_size = self.config.MAX_CHUNK_SIZE
         if chunk_size < self.config.MIN_CHUNK_SIZE:
             chunk_size = self.config.MIN_CHUNK_SIZE
-        
+
+        # 如果配置了语义分块，使用优化的分块器
+        if hasattr(self, 'use_semantic_chunking') and self.use_semantic_chunking:
+            return self.semantic_chunker.chunk_text(content)
+
+        # 传统固定窗口分块
         chunks = []
         step = max(1, chunk_size - chunk_overlap)
-        
+
         for i in range(0, len(content), step):
             chunk = content[i:i + chunk_size].strip()
             if len(chunk) >= self.config.MIN_CHUNK_SIZE:
                 chunks.append(chunk)
-        
+
         return chunks
     
     def add_texts(self, texts: List[str]) -> List[str]:
         """批量添加文本，返回生成的ID列表"""
         if not texts:
             return []
-        
+
         with self.lock:
             try:
                 # 生成嵌入向量
                 logger.info(f"正在生成 {len(texts)} 个文本的嵌入向量...")
                 embeddings = self.embedding_model.encode(
-                    texts, 
-                    convert_to_numpy=True, 
-                    show_progress_bar=False, 
+                    texts,
+                    convert_to_numpy=True,
+                    show_progress_bar=False,
                     normalize_embeddings=True,
                     batch_size=self.config.BATCH_SIZE
                 )
-                
+
+                # 检查IVF索引是否需要训练
+                if self.config.INDEX_TYPE == "IVFFlat" and hasattr(self.index, 'is_trained') and not self.index.is_trained:
+                    logger.info(f"IVF索引需要训练，使用当前 {len(texts)} 个向量作为训练数据...")
+                    # 对于IVF索引，训练数据数量需要至少大于 nlist * 39
+                    min_train_size = max(self.config.NLIST * 39, len(texts))
+
+                    if len(texts) >= min_train_size:
+                        # 使用当前向量训练索引
+                        self.index.train(embeddings)
+                        logger.info(f"IVF索引训练完成，使用了 {len(texts)} 个训练向量")
+                    else:
+                        logger.warning(f"IVF索引训练需要至少 {min_train_size} 个向量，当前只有 {len(texts)} 个")
+                        logger.warning("切换到FlatIP索引以避免训练问题...")
+                        # 自动切换到FlatIP索引
+                        self.index = faiss.IndexFlatIP(self.config.EMBEDDING_DIM)
+
                 # 生成唯一ID
                 ids = [str(uuid.uuid4()) for _ in texts]
-                
+
                 # 添加到索引
                 self.index.add(embeddings)
-                
+
                 # 更新元数据
                 start_faiss_id = self.index.ntotal - len(texts)
                 for i, (text, unique_id) in enumerate(zip(texts, ids)):
                     faiss_id = start_faiss_id + i
                     self.id_to_chunk[str(faiss_id)] = text
                     self.chunk_to_id[text] = str(faiss_id)
-                
+
                 self.dirty = True
                 logger.info(f"成功添加 {len(texts)} 个文本块，总向量数: {self.index.ntotal}")
                 return ids
-                
+
             except Exception as e:
                 logger.error(f"添加文本失败: {e}")
                 raise HTTPException(status_code=500, detail=f"添加文本失败: {str(e)}")
     
-    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """搜索相似文本"""
+    def search(self, query: str, top_k: int = 5, use_optimization: bool = True) -> List[Dict[str, Any]]:
+        """搜索相似文本 - 支持优化模式"""
         with self.lock:
             try:
                 if self.index.ntotal == 0:
                     return []
-                
-                # 生成查询向量
-                query_embedding = self.embedding_model.encode(
-                    [query], 
-                    convert_to_numpy=True, 
-                    show_progress_bar=False, 
-                    normalize_embeddings=True
-                )
-                
-                # 搜索
-                distances, indices = self.index.search(query_embedding, min(top_k, self.index.ntotal))
-                
-                results = []
-                for dist, idx in zip(distances[0], indices[0]):
-                    if idx != -1 and str(idx) in self.id_to_chunk:
-                        results.append({
-                            "text": self.id_to_chunk[str(idx)],
-                            "score": float(dist),
-                            "faiss_id": int(idx)
-                        })
-                
-                logger.info(f"搜索完成，返回 {len(results)} 个结果")
-                return results
-                
+
+                # 检查索引是否已训练（对于IVF索引）
+                if hasattr(self.index, 'is_trained') and not self.index.is_trained:
+                    logger.warning("IVF索引尚未训练，无法进行搜索")
+                    return []
+
+                # 使用优化的搜索方法
+                if use_optimization and hasattr(self, 'advanced_search_index'):
+                    return self.advanced_search_index.optimized_search(query, top_k)
+
+                # 传统搜索方法
+                return self._traditional_search(query, top_k)
+
             except Exception as e:
                 logger.error(f"搜索失败: {e}")
                 raise HTTPException(status_code=500, detail=f"搜索失败: {str(e)}")
+
+    def _traditional_search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+        """传统搜索方法"""
+        # 生成查询向量
+        query_embedding = self.embedding_model.encode(
+            [query],
+            convert_to_numpy=True,
+            show_progress_bar=False,
+            normalize_embeddings=True
+        )
+
+        # 动态调整搜索参数
+        if hasattr(self.index, 'nprobe'):  # IVF索引
+            # 根据数据量动态调整nprobe
+            optimal_nprobe = min(self.config.NPROBE, self.config.NLIST // 2, 20)
+            self.index.nprobe = max(optimal_nprobe, 5)  # 确保至少搜索5个聚类
+        elif hasattr(self.index, 'hnsw'):  # HNSW索引
+            # 增加搜索深度以提高精度
+            self.index.hnsw.efSearch = max(self.config.EF_SEARCH, 100)
+
+        # 搜索，使用更大的候选集
+        search_k = min(top_k * 2, self.index.ntotal)
+        distances, indices = self.index.search(query_embedding, search_k)
+
+        results = []
+        for dist, idx in zip(distances[0], indices[0]):
+            if idx != -1 and str(idx) in self.id_to_chunk:
+                results.append({
+                    "text": self.id_to_chunk[str(idx)],
+                    "score": float(dist),
+                    "faiss_id": int(idx),
+                    "search_method": "traditional"
+                })
+
+        logger.info(f"传统搜索完成，返回 {len(results)} 个结果")
+        return results[:top_k]
     
     def delete_texts(self, texts_to_delete: List[str]) -> int:
         """精确删除指定文本"""
@@ -292,16 +385,126 @@ class FaissVectorDB:
     def get_stats(self) -> Dict[str, Any]:
         """获取数据库统计信息"""
         with self.lock:
-            return {
+            stats = {
                 "total_vectors": self.index.ntotal if self.index else 0,
                 "embedding_dim": self.config.EMBEDDING_DIM,
                 "index_type": self.config.INDEX_TYPE,
                 "model_name": self.config.MODEL_NAME,
-                "has_unsaved_changes": self.dirty
+                "has_unsaved_changes": self.dirty,
+                "search_optimization_enabled": hasattr(self, 'advanced_search_index')
             }
 
+            # 添加索引特定的状态信息
+            if self.index:
+                if hasattr(self.index, 'is_trained'):
+                    stats["is_trained"] = self.index.is_trained
+                if hasattr(self.index, 'ntotal'):
+                    stats["total_vectors"] = self.index.ntotal
+                if hasattr(self.index, 'nlist'):
+                    stats["nlist"] = self.index.nlist
+                if hasattr(self.index, 'nprobe'):
+                    stats["nprobe"] = self.index.nprobe
+
+            # 添加搜索质量监控
+            if hasattr(self, 'search_metrics'):
+                stats.update(self.search_metrics.get_summary())
+
+            return stats
+
+    def enable_search_optimization(self):
+        """启用搜索优化"""
+        with self.lock:
+            try:
+                if not hasattr(self, 'advanced_search_index'):
+                    from search_optimization import AdvancedSearchIndex
+                    self.advanced_search_index = AdvancedSearchIndex(self.config)
+                    self.advanced_search_index.index = self.index
+                    self.advanced_search_index.id_to_chunk = self.id_to_chunk
+                    self.advanced_search_index.chunk_to_id = self.chunk_to_id
+
+                    # 启用语义分块
+                    from search_optimization import SemanticChunker
+                    self.semantic_chunker = SemanticChunker(
+                        self.embedding_model,
+                        min_chunk_size=self.config.MIN_CHUNK_SIZE,
+                        max_chunk_size=self.config.MAX_CHUNK_SIZE
+                    )
+                    self.use_semantic_chunking = True
+
+                    logger.info("✅ 搜索优化已启用")
+                    return True
+            except Exception as e:
+                logger.error(f"启用搜索优化失败: {e}")
+                return False
+
+    def get_search_recommendations(self) -> Dict[str, Any]:
+        """获取搜索优化建议"""
+        if hasattr(self, 'advanced_search_index'):
+            return self.advanced_search_index.get_search_recommendations()
+        else:
+            # 基础建议
+            total_vectors = self.index.ntotal if self.index else 0
+            recommendations = []
+
+            if total_vectors < 1000:
+                recommendations.append("数据量较小，建议使用FlatIP索引获得最佳精度")
+                recommendations.append("考虑启用语义分块以提升向量质量")
+            elif total_vectors < 50000:
+                recommendations.append("考虑使用HNSW索引平衡精度和性能")
+                if self.config.INDEX_TYPE == "IVFFlat":
+                    recommendations.append("建议增加NPROBE参数到15-20以提升精度")
+            else:
+                recommendations.append("大数据量场景，建议使用IVFFlat或HNSW索引")
+                recommendations.append("考虑启用搜索优化以获得更好的结果多样性")
+
+            return {
+                "current_vectors": total_vectors,
+                "current_index_type": self.config.INDEX_TYPE,
+                "optimization_enabled": hasattr(self, 'advanced_search_index'),
+                "recommendations": recommendations
+            }
+
+    def benchmark_search_quality(self, test_queries: List[str]) -> Dict[str, Any]:
+        """搜索质量基准测试"""
+        if not test_queries or self.index.ntotal == 0:
+            return {"error": "无法进行基准测试：无查询或数据为空"}
+
+        try:
+            quality_results = []
+            for query in test_queries:
+                # 传统搜索
+                traditional_results = self.search(query, top_k=5, use_optimization=False)
+
+                # 优化搜索
+                if hasattr(self, 'advanced_search_index'):
+                    optimized_results = self.search(query, top_k=5, use_optimization=True)
+                    opt_avg_score = np.mean([r.get('relevance_score', r.get('score', 0)) for r in optimized_results])
+                else:
+                    opt_avg_score = 0
+
+                trad_avg_score = np.mean([r.get('score', 0) for r in traditional_results])
+
+                quality_results.append({
+                    "query": query,
+                    "traditional_avg_score": float(trad_avg_score),
+                    "optimized_avg_score": float(opt_avg_score),
+                    "improvement": float(opt_avg_score - trad_avg_score)
+                })
+
+            overall_improvement = np.mean([r["improvement"] for r in quality_results])
+
+            return {
+                "test_queries_count": len(test_queries),
+                "overall_improvement": float(overall_improvement),
+                "detailed_results": quality_results,
+                "optimization_enabled": hasattr(self, 'advanced_search_index')
+            }
+
+        except Exception as e:
+            return {"error": f"基准测试失败: {str(e)}"}
+
 # 全局向量数据库实例
-config = Config()
+config = get_config()
 vector_db = None
 
 @asynccontextmanager
@@ -333,7 +536,7 @@ class Document(BaseModel):
     content: str = Field(..., description="文档内容", max_length=50000)
     chunk_size: int = Field(default=500, description="分块大小", ge=50, le=2000)
     chunk_overlap: int = Field(default=50, description="分块重叠", ge=0, le=500)
-    
+
     @validator('chunk_overlap')
     def validate_overlap(cls, v, values):
         if 'chunk_size' in values and v >= values['chunk_size']:
@@ -343,6 +546,10 @@ class Document(BaseModel):
 class Query(BaseModel):
     question: str = Field(..., description="查询问题", max_length=1000)
     top_k: int = Field(default=3, description="返回结果数量", ge=1, le=50)
+    use_optimization: bool = Field(default=True, description="是否使用搜索优化")
+
+class BenchmarkQueries(BaseModel):
+    queries: List[str] = Field(..., description="测试查询列表", max_items=20)
 
 class BatchTexts(BaseModel):
     texts: List[str] = Field(..., description="批量文本列表", max_items=100)
@@ -440,19 +647,24 @@ async def search_knowledge(query: Query):
     try:
         if not vector_db:
             raise HTTPException(status_code=503, detail="向量数据库未初始化")
-        
+
         if vector_db.index.ntotal == 0:
             return {"relevant_chunks": [], "message": "知识库为空，请先添加文档"}
-        
-        results = vector_db.search(query.question, query.top_k)
-        
+
+        results = vector_db.search(query.question, query.top_k, query.use_optimization)
+
+        # 添加搜索方法信息
+        search_method = "optimized" if query.use_optimization and hasattr(vector_db, 'advanced_search_index') else "traditional"
+
         return {
             "relevant_chunks": [result["text"] for result in results],
             "detailed_results": results,
             "query": query.question,
-            "total_found": len(results)
+            "total_found": len(results),
+            "search_method": search_method,
+            "optimization_enabled": query.use_optimization
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -488,6 +700,66 @@ async def get_stats():
         logger.error(f"获取统计信息失败: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
+@app.post("/enable_optimization", summary="启用搜索优化")
+async def enable_search_optimization():
+    """启用搜索优化功能"""
+    try:
+        if not vector_db:
+            raise HTTPException(status_code=503, detail="向量数据库未初始化")
+
+        success = vector_db.enable_search_optimization()
+        if success:
+            return {
+                "message": "搜索优化已成功启用",
+                "features": [
+                    "语义感知文本分块",
+                    "动态搜索参数调整",
+                    "多样性重排序(MMR)",
+                    "搜索质量评估",
+                    "相关性阈值过滤"
+                ]
+            }
+        else:
+            raise HTTPException(status_code=500, detail="启用搜索优化失败")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"启用搜索优化失败: {e}")
+        raise HTTPException(status_code=500, detail="内部服务器错误")
+
+@app.get("/search_recommendations", summary="获取搜索优化建议")
+async def get_search_recommendations():
+    """获取针对当前数据量的搜索优化建议"""
+    try:
+        if not vector_db:
+            raise HTTPException(status_code=503, detail="向量数据库未初始化")
+
+        recommendations = vector_db.get_search_recommendations()
+        return recommendations
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取搜索建议失败: {e}")
+        raise HTTPException(status_code=500, detail="内部服务器错误")
+
+@app.post("/benchmark_search_quality", summary="搜索质量基准测试")
+async def benchmark_search_quality(benchmark: BenchmarkQueries):
+    """对比传统搜索和优化搜索的质量差异"""
+    try:
+        if not vector_db:
+            raise HTTPException(status_code=503, detail="向量数据库未初始化")
+
+        results = vector_db.benchmark_search_quality(benchmark.queries)
+        return results
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"基准测试失败: {e}")
+        raise HTTPException(status_code=500, detail="内部服务器错误")
+
 @app.get("/health", summary="健康检查")
 async def health_check():
     """健康检查端点"""
@@ -498,4 +770,10 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
+    uvicorn.run(
+        app,
+        host=config.API_HOST,
+        port=config.API_PORT,
+        log_level=config.LOG_LEVEL.lower(),
+        workers=config.API_WORKERS if config.API_WORKERS > 1 else 1
+    )
