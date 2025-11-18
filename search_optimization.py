@@ -246,8 +246,8 @@ class AdvancedSearchIndex:
         self.search_config = {
             'ivf_nprobe': min(config.NPROBE, config.NLIST // 2),  # 动态调整nprobe
             'hnsw_ef_search': max(config.EF_SEARCH, 100),  # 增加搜索精度
-            'diversity_weight': 0.2,  # 多样性权重
-            'relevance_threshold': 0.5  # 相关性阈值
+            'diversity_weight': 0.1,  # 多样性权重（降低以保持相关性优先）
+            'relevance_threshold': 0.1  # 相关性阈值（降低以避免过度过滤）
         }
 
     def _create_optimized_index(self):
@@ -317,12 +317,24 @@ class AdvancedSearchIndex:
         for i, score in enumerate(relevance_scores):
             results[i].relevance_score = score
 
-        # 过滤低质量结果
+        # 自适应阈值：如果高质量结果不够，放宽阈值
         threshold = self.search_config['relevance_threshold']
         filtered_results = [r for r in results if r.relevance_score >= threshold]
 
-        # 重新排序
-        if use_reranking and len(filtered_results) > 1:
+        # 如果过滤后结果太少，放宽阈值
+        if len(filtered_results) < top_k:
+            # 使用更低的阈值
+            relaxed_threshold = max(0.05, threshold * 0.5)
+            filtered_results = [r for r in results if r.relevance_score >= relaxed_threshold]
+
+        # 如果结果仍然太少，使用所有结果按相关性排序
+        if len(filtered_results) < top_k:
+            # 按相关性分数排序所有结果
+            all_results_sorted = sorted(results, key=lambda x: x.relevance_score, reverse=True)
+            filtered_results = all_results_sorted[:max(top_k, len(all_results_sorted))]
+
+        # 重新排序（仅在结果充足时进行多样性重排）
+        if use_reranking and len(filtered_results) > top_k // 2:
             filtered_results = self.quality_optimizer.rerank_by_diversity(
                 filtered_results,
                 self.search_config['diversity_weight']

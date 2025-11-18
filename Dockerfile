@@ -28,6 +28,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # 复制应用代码
 COPY faiss_server_optimized.py .
+COPY search_optimization.py .
 COPY config.py .
 COPY entrypoint.sh .
 COPY healthcheck.sh .

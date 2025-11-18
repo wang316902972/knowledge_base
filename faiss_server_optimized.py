@@ -39,15 +39,17 @@ class FaissVectorDB:
     def _initialize(self):
         """初始化模型和索引"""
         try:
+            logger.info(f"环境: {self.config.ENVIRONMENT}")
             logger.info(f"业务ID: {self.config.BUSINESS_ID}")
             logger.info(f"数据目录: {self.config.DATA_DIR}")
             logger.info(f"索引文件: {self.config.INDEX_FILE}")
             logger.info(f"元数据文件: {self.config.METADATA_FILE}")
+            logger.info(f"是否使用GPU: {self.config.USE_GPU}")
+            logger.info(f"模型名称: {self.config.MODEL_NAME}")
 
             # 确保数据目录存在
             os.makedirs(self.config.DATA_DIR, exist_ok=True)
 
-            logger.info(f"正在加载嵌入模型: {self.config.MODEL_NAME}")
             self.embedding_model = SentenceTransformer(self.config.MODEL_NAME)
 
             # 动态获取模型维度
@@ -263,19 +265,38 @@ class FaissVectorDB:
             # 增加搜索深度以提高精度
             self.index.hnsw.efSearch = max(self.config.EF_SEARCH, 100)
 
-        # 搜索，使用更大的候选集
-        search_k = min(top_k * 2, self.index.ntotal)
+        # 搜索，使用更大的候选集以提高精度
+        search_k = min(top_k * 4, self.index.ntotal)  # 增加候选数量
         distances, indices = self.index.search(query_embedding, search_k)
 
+        # 构建结果并添加基本的相关性过滤
         results = []
         for dist, idx in zip(distances[0], indices[0]):
             if idx != -1 and str(idx) in self.id_to_chunk:
-                results.append({
-                    "text": self.id_to_chunk[str(idx)],
-                    "score": float(dist),
-                    "faiss_id": int(idx),
-                    "search_method": "traditional"
-                })
+                # 处理可能的无效浮点值
+                score = float(dist)
+                if not (score == float('inf') or score == float('-inf') or score != score):  # 检查 inf, -inf, nan
+                    # 基本的文本相关性检查：确保查询词在结果中
+                    text = self.id_to_chunk[str(idx)]
+                    query_terms = set(query.lower().split())
+                    text_lower = text.lower()
+
+                    # 计算简单的文本匹配分数
+                    term_matches = sum(1 for term in query_terms if term in text_lower)
+                    text_relevance = term_matches / max(len(query_terms), 1)
+
+                    # 只有当有一定文本相关性时才添加结果
+                    if text_relevance > 0.1:  # 至少有一些词匹配
+                        results.append({
+                            "text": text,
+                            "score": score,
+                            "faiss_id": int(idx),
+                            "text_relevance": text_relevance,  # 添加文本相关性分数
+                            "search_method": "traditional"
+                        })
+
+        # 按向量和文本相关性综合排序
+        results.sort(key=lambda x: (x["score"], x["text_relevance"]), reverse=True)
 
         logger.info(f"传统搜索完成，返回 {len(results)} 个结果")
         return results[:top_k]
@@ -416,6 +437,19 @@ class FaissVectorDB:
         with self.lock:
             try:
                 if not hasattr(self, 'advanced_search_index'):
+                    logger.info("正在初始化AdvancedSearchIndex...")
+                    logger.info(f"Config type: {type(self.config)}")
+                    logger.info(f"Config attributes: {[attr for attr in dir(self.config) if not attr.startswith('_')]}")
+
+                    # 验证必要的配置属性
+                    required_attrs = ['MODEL_NAME', 'EMBEDDING_DIM', 'MIN_CHUNK_SIZE', 'MAX_CHUNK_SIZE']
+                    for attr in required_attrs:
+                        if not hasattr(self.config, attr):
+                            logger.error(f"Config missing required attribute: {attr}")
+                            return False
+                        else:
+                            logger.info(f"Config {attr}: {getattr(self.config, attr)}")
+
                     from search_optimization import AdvancedSearchIndex
                     self.advanced_search_index = AdvancedSearchIndex(self.config)
                     self.advanced_search_index.index = self.index
@@ -434,7 +468,9 @@ class FaissVectorDB:
                     logger.info("✅ 搜索优化已启用")
                     return True
             except Exception as e:
+                import traceback
                 logger.error(f"启用搜索优化失败: {e}")
+                logger.error(f"详细错误信息: {traceback.format_exc()}")
                 return False
 
     def get_search_recommendations(self) -> Dict[str, Any]:
@@ -484,18 +520,27 @@ class FaissVectorDB:
 
                 trad_avg_score = np.mean([r.get('score', 0) for r in traditional_results])
 
+                # 安全的浮点数转换函数
+                def safe_float(value):
+                    try:
+                        if value == float('inf') or value == float('-inf') or value != value:
+                            return 0.0
+                        return float(value)
+                    except (ValueError, TypeError):
+                        return 0.0
+
                 quality_results.append({
                     "query": query,
-                    "traditional_avg_score": float(trad_avg_score),
-                    "optimized_avg_score": float(opt_avg_score),
-                    "improvement": float(opt_avg_score - trad_avg_score)
+                    "traditional_avg_score": safe_float(trad_avg_score),
+                    "optimized_avg_score": safe_float(opt_avg_score),
+                    "improvement": safe_float(opt_avg_score - trad_avg_score)
                 })
 
             overall_improvement = np.mean([r["improvement"] for r in quality_results])
 
             return {
                 "test_queries_count": len(test_queries),
-                "overall_improvement": float(overall_improvement),
+                "overall_improvement": safe_float(overall_improvement),
                 "detailed_results": quality_results,
                 "optimization_enabled": hasattr(self, 'advanced_search_index')
             }
@@ -549,10 +594,10 @@ class Query(BaseModel):
     use_optimization: bool = Field(default=True, description="是否使用搜索优化")
 
 class BenchmarkQueries(BaseModel):
-    queries: List[str] = Field(..., description="测试查询列表", max_items=20)
+    queries: List[str] = Field(..., description="测试查询列表", max_length=20)
 
 class BatchTexts(BaseModel):
-    texts: List[str] = Field(..., description="批量文本列表", max_items=100)
+    texts: List[str] = Field(..., description="批量文本列表", max_length=100)
 
 # API端点
 @app.post("/add", summary="添加文档")
