@@ -1,5 +1,5 @@
-# 使用官方Python镜像
-FROM python:3.9-slim
+# 使用官方Python镜像 - 升级到3.11以支持mcp包
+FROM python:3.11-slim
 
 # 设置工作目录
 WORKDIR /app
@@ -26,18 +26,16 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# 复制应用代码
-COPY faiss_server_optimized.py .
-COPY search_optimization.py .
-COPY config.py .
+# 注意：应用代码通过docker-compose卷挂载，不在这里复制
+# 只复制启动脚本（确保它们存在）
 COPY entrypoint.sh .
 COPY healthcheck.sh .
 
 # 创建数据目录和日志目录
 RUN mkdir -p /app/data /app/logs
 
-# 设置文件权限
-RUN chmod +x faiss_server_optimized.py entrypoint.sh healthcheck.sh
+# 设置脚本文件权限
+RUN chmod +x entrypoint.sh healthcheck.sh
 
 # 设置默认环境变量
 ENV BUSINESS_ID=default

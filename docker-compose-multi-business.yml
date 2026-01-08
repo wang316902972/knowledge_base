@@ -8,6 +8,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      - .:/app
     environment:
       - ENVIRONMENT=production
       - BUSINESS_ID=default
@@ -26,6 +27,7 @@ services:
   #   volumes:
   #     - ./data:/app/data
   #     - ./logs:/app/logs
+  #     - .:/app
   #   environment:
   #     - ENVIRONMENT=production
   #     - BUSINESS_ID=document

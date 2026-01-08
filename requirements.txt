@@ -5,6 +5,9 @@ pydantic>=2.0.0
 numpy>=1.24.0
 sentence-transformers>=2.2.0
 
+# MCP (Model Context Protocol) support
+mcp>=0.9.0
+
 # FAISS - choose one based on your hardware
 faiss-gpu-cu12>=1.12.0
 
