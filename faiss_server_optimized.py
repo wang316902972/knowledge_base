@@ -7,11 +7,11 @@ import uuid
 import asyncio
 import os
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Sequence
+from typing import List, Optional, Dict, Any, Sequence, Union
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 from sentence_transformers import SentenceTransformer
 from config import get_config, Config
 from search_optimization import AdvancedSearchIndex, QualityMetrics
@@ -614,9 +614,10 @@ class Document(BaseModel):
     chunk_size: int = Field(default=500, description="分块大小", ge=50, le=2000)
     chunk_overlap: int = Field(default=50, description="分块重叠", ge=0, le=500)
 
-    @validator('chunk_overlap')
-    def validate_overlap(cls, v, values):
-        if 'chunk_size' in values and v >= values['chunk_size']:
+    @field_validator('chunk_overlap')
+    @classmethod
+    def validate_overlap(cls, v, info):
+        if info.data.get('chunk_size') and v >= info.data['chunk_size']:
             raise ValueError('chunk_overlap must be less than chunk_size')
         return v
 
@@ -633,8 +634,24 @@ class BatchTexts(BaseModel):
 
 
 # ============================================================================
-# MCP 协议模型定义
+# MCP 协议模型定义 - JSON-RPC 2.0 格式
 # ============================================================================
+
+class JSONRPCRequest(BaseModel):
+    """JSON-RPC 2.0 请求"""
+    jsonrpc: str = "2.0"
+    method: str
+    params: Optional[Dict[str, Any]] = None
+    id: Optional[Union[int, str]] = None
+
+
+class JSONRPCResponse(BaseModel):
+    """JSON-RPC 2.0 响应"""
+    jsonrpc: str = "2.0"
+    result: Optional[Any] = None
+    error: Optional[Dict[str, Any]] = None
+    id: Optional[Union[int, str]] = None
+
 
 class MCPTool(BaseModel):
     """MCP 工具定义"""
@@ -643,41 +660,10 @@ class MCPTool(BaseModel):
     inputSchema: Dict[str, Any]
 
 
-class MCPToolsListResponse(BaseModel):
-    """工具列表响应"""
-    tools: List[MCPTool]
-
-
-class MCPCallToolRequest(BaseModel):
-    """调用工具请求"""
-    name: str
-    arguments: Dict[str, Any] = Field(default_factory=dict)
-
-
 class MCPContent(BaseModel):
     """MCP 内容"""
     type: str
     text: str
-
-
-class MCPCallToolResponse(BaseModel):
-    """调用工具响应"""
-    content: List[MCPContent]
-    isError: bool = False
-
-
-class MCPInitializeRequest(BaseModel):
-    """初始化请求"""
-    protocolVersion: str = "2024-11-05"
-    capabilities: Dict[str, Any] = Field(default_factory=dict)
-    clientInfo: Dict[str, str] = Field(default_factory=dict)
-
-
-class MCPInitializeResponse(BaseModel):
-    """初始化响应"""
-    protocolVersion: str = "2024-11-05"
-    capabilities: Dict[str, Any]
-    serverInfo: Dict[str, str]
 
 
 # ============================================================================
@@ -822,18 +808,18 @@ def get_mcp_tools() -> List[MCPTool]:
     ]
 
 
-async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> MCPCallToolResponse:
-    """执行 MCP 工具调用"""
+async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """执行 MCP 工具调用 - 返回标准格式"""
     global vector_db
     
     if vector_db is None:
-        return MCPCallToolResponse(
-            content=[MCPContent(
-                type="text",
-                text=json.dumps({"error": "向量数据库未初始化"}, ensure_ascii=False)
-            )],
-            isError=True
-        )
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({"error": "向量数据库未初始化"}, ensure_ascii=False)
+            }],
+            "isError": True
+        }
     
     try:
         if name == "search_knowledge":
@@ -846,16 +832,16 @@ async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> MCPCallToolR
                 raise ValueError("query parameter is required")
             
             if vector_db.index.ntotal == 0:
-                return MCPCallToolResponse(
-                    content=[MCPContent(
-                        type="text",
-                        text=json.dumps({
+                return {
+                    "content": [{
+                        "type": "text",
+                        "text": json.dumps({
                             "relevant_chunks": [],
                             "message": "知识库为空，请先添加文档",
                             "total_found": 0
                         }, ensure_ascii=False, indent=2)
-                    )]
-                )
+                    }]
+                }
             
             results = vector_db.search(query, top_k, use_optimization)
             search_method = "optimized" if use_optimization and hasattr(vector_db, 'advanced_search_index') else "traditional"
@@ -869,12 +855,12 @@ async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> MCPCallToolR
                 "optimization_enabled": use_optimization
             }
             
-            return MCPCallToolResponse(
-                content=[MCPContent(
-                    type="text",
-                    text=json.dumps(response, ensure_ascii=False, indent=2)
-                )]
-            )
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(response, ensure_ascii=False, indent=2)
+                }]
+            }
         
         elif name == "add_document":
             # 添加文档
@@ -888,15 +874,15 @@ async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> MCPCallToolR
             chunks = vector_db._generate_chunks(content, chunk_size, chunk_overlap)
             
             if not chunks:
-                return MCPCallToolResponse(
-                    content=[MCPContent(
-                        type="text",
-                        text=json.dumps({
+                return {
+                    "content": [{
+                        "type": "text",
+                        "text": json.dumps({
                             "error": "文档内容过短，无法生成有效分块"
                         }, ensure_ascii=False)
-                    )],
-                    isError=True
-                )
+                    }],
+                    "isError": True
+                }
             
             ids = vector_db.add_texts(chunks)
             
@@ -910,12 +896,12 @@ async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> MCPCallToolR
                 "chunk_ids": ids[:5] if len(ids) > 5 else ids
             }
             
-            return MCPCallToolResponse(
-                content=[MCPContent(
-                    type="text",
-                    text=json.dumps(response, ensure_ascii=False, indent=2)
-                )]
-            )
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(response, ensure_ascii=False, indent=2)
+                }]
+            }
         
         elif name == "delete_document":
             # 删除文档
@@ -929,15 +915,15 @@ async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> MCPCallToolR
             chunks = vector_db._generate_chunks(content, chunk_size, chunk_overlap)
             
             if not chunks:
-                return MCPCallToolResponse(
-                    content=[MCPContent(
-                        type="text",
-                        text=json.dumps({
+                return {
+                    "content": [{
+                        "type": "text",
+                        "text": json.dumps({
                             "error": "文档内容过短，无法生成有效分块"
                         }, ensure_ascii=False)
-                    )],
-                    isError=True
-                )
+                    }],
+                    "isError": True
+                }
             
             deleted_count = vector_db.delete_texts(chunks)
             
@@ -950,12 +936,12 @@ async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> MCPCallToolR
                 "deleted_count": deleted_count
             }
             
-            return MCPCallToolResponse(
-                content=[MCPContent(
-                    type="text",
-                    text=json.dumps(response, ensure_ascii=False, indent=2)
-                )]
-            )
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(response, ensure_ascii=False, indent=2)
+                }]
+            }
         
         elif name == "batch_add_texts":
             # 批量添加文本
@@ -978,23 +964,23 @@ async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> MCPCallToolR
                 "added_count": len(ids)
             }
             
-            return MCPCallToolResponse(
-                content=[MCPContent(
-                    type="text",
-                    text=json.dumps(response, ensure_ascii=False, indent=2)
-                )]
-            )
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(response, ensure_ascii=False, indent=2)
+                }]
+            }
         
         elif name == "get_stats":
             # 获取统计信息
             stats = vector_db.get_stats()
             
-            return MCPCallToolResponse(
-                content=[MCPContent(
-                    type="text",
-                    text=json.dumps(stats, ensure_ascii=False, indent=2)
-                )]
-            )
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(stats, ensure_ascii=False, indent=2)
+                }]
+            }
         
         elif name == "enable_optimization":
             # 启用搜索优化
@@ -1016,24 +1002,24 @@ async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> MCPCallToolR
                     "error": "启用搜索优化失败"
                 }
             
-            return MCPCallToolResponse(
-                content=[MCPContent(
-                    type="text",
-                    text=json.dumps(response, ensure_ascii=False, indent=2)
-                )],
-                isError=not success
-            )
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(response, ensure_ascii=False, indent=2)
+                }],
+                "isError": not success
+            }
         
         elif name == "get_recommendations":
             # 获取搜索建议
             recommendations = vector_db.get_search_recommendations()
             
-            return MCPCallToolResponse(
-                content=[MCPContent(
-                    type="text",
-                    text=json.dumps(recommendations, ensure_ascii=False, indent=2)
-                )]
-            )
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(recommendations, ensure_ascii=False, indent=2)
+                }]
+            }
         
         elif name == "save_index":
             # 手动保存
@@ -1044,65 +1030,127 @@ async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> MCPCallToolR
                 "total_vectors": vector_db.index.ntotal
             }
             
-            return MCPCallToolResponse(
-                content=[MCPContent(
-                    type="text",
-                    text=json.dumps(response, ensure_ascii=False, indent=2)
-                )]
-            )
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(response, ensure_ascii=False, indent=2)
+                }]
+            }
         
         else:
             raise ValueError(f"Unknown tool: {name}")
     
     except Exception as e:
         logger.error(f"Tool execution error: {e}")
-        return MCPCallToolResponse(
-            content=[MCPContent(
-                type="text",
-                text=json.dumps({
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({
                     "error": str(e),
                     "tool": name
                 }, ensure_ascii=False)
-            )],
-            isError=True
+            }],
+            "isError": True
+        }
+
+
+async def handle_jsonrpc_request(request: JSONRPCRequest) -> JSONRPCResponse:
+    """处理 JSON-RPC 请求"""
+    try:
+        method = request.method
+        params = request.params or {}
+        
+        # 处理 initialize 方法
+        if method == "initialize":
+            result = {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "faiss-vector-search",
+                    "version": "2.0.0"
+                }
+            }
+            return JSONRPCResponse(jsonrpc="2.0", result=result, id=request.id)
+        
+        # 处理 tools/list 方法
+        elif method == "tools/list":
+            tools = get_mcp_tools()
+            result = {
+                "tools": [tool.dict() for tool in tools]
+            }
+            return JSONRPCResponse(jsonrpc="2.0", result=result, id=request.id)
+        
+        # 处理 tools/call 方法
+        elif method == "tools/call":
+            tool_name = params.get("name")
+            arguments = params.get("arguments", {})
+            
+            if not tool_name:
+                return JSONRPCResponse(
+                    jsonrpc="2.0",
+                    error={
+                        "code": -32602,
+                        "message": "Invalid params: 'name' is required"
+                    },
+                    id=request.id
+                )
+            
+            result = await execute_mcp_tool(tool_name, arguments)
+            return JSONRPCResponse(jsonrpc="2.0", result=result, id=request.id)
+        
+        # 处理 notifications/initialized 通知
+        elif method == "notifications/initialized":
+            logger.info("收到客户端 initialized 通知")
+            # 通知不需要响应
+            return None
+        
+        else:
+            return JSONRPCResponse(
+                jsonrpc="2.0",
+                error={
+                    "code": -32601,
+                    "message": f"Method not found: {method}"
+                },
+                id=request.id
+            )
+    
+    except Exception as e:
+        logger.error(f"JSON-RPC 处理错误: {e}")
+        return JSONRPCResponse(
+            jsonrpc="2.0",
+            error={
+                "code": -32603,
+                "message": f"Internal error: {str(e)}"
+            },
+            id=request.id
         )
 
 
 # ============================================================================
-# MCP 协议端点
+# MCP 协议端点 - 标准 JSON-RPC 2.0
 # ============================================================================
 
-@app.post("/mcp/initialize", response_model=MCPInitializeResponse, tags=["MCP"])
-async def mcp_initialize(request: MCPInitializeRequest):
-    """MCP 初始化"""
-    logger.info(f"MCP 初始化请求: {request.dict()}")
+@app.post("/mcp", tags=["MCP"])
+async def mcp_jsonrpc_endpoint(request: JSONRPCRequest):
+    """
+    MCP 标准 JSON-RPC 2.0 端点
     
-    return MCPInitializeResponse(
-        protocolVersion="2024-11-05",
-        capabilities={
-            "tools": {},
-            "resources": {}
-        },
-        serverInfo={
-            "name": "faiss-vector-search",
-            "version": "2.0.0"
-        }
-    )
-
-
-@app.get("/mcp/tools", response_model=MCPToolsListResponse, tags=["MCP"])
-async def mcp_list_tools():
-    """列出所有可用工具"""
-    tools = get_mcp_tools()
-    return MCPToolsListResponse(tools=tools)
-
-
-@app.post("/mcp/tools/call", response_model=MCPCallToolResponse, tags=["MCP"])
-async def mcp_call_tool(request: MCPCallToolRequest):
-    """调用工具"""
-    logger.info(f"MCP调用工具: {request.name}, 参数: {request.arguments}")
+    支持的方法:
+    - initialize: 初始化 MCP 连接
+    - tools/list: 列出所有可用工具
+    - tools/call: 调用指定工具
+    - notifications/initialized: 客户端初始化完成通知
+    """
+    logger.info(f"收到 JSON-RPC 请求: method={request.method}, id={request.id}")
     
-    response = await execute_mcp_tool(request.name, request.arguments)
+    response = await handle_jsonrpc_request(request)
+    
+    # 通知类型的请求不返回响应
+    if response is None:
+        return {"status": "notification_received"}
+    
     return response
 
 
@@ -1321,8 +1369,12 @@ async def health_check():
     return {
         "status": "healthy" if vector_db else "initializing",
         "mcp_enabled": True,
+        "mcp_protocol": "JSON-RPC 2.0",
         "mcp_protocol_version": "2024-11-05",
         "api_version": "2.0.0",
+        "endpoints": {
+            "mcp_standard": "POST /mcp (JSON-RPC 2.0)"
+        },
         "features": {
             "mcp_protocol": True,
             "rest_api": True,
