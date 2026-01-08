@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  faiss-mcp-http:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: faiss-mcp-http-server
+    ports:
+      - "8001:8001"
+    environment:
+      - BUSINESS_ID=default
+      - FAISS_INDEX_TYPE=FlatIP
+      - EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2
+      - EMBEDDING_DIM=384
+      - ENABLE_SEARCH_OPTIMIZATION=true
+      - AUTO_SAVE=true
+      - API_HOST=0.0.0.0
+      - API_PORT=8001
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    command: python3 mcp_http_server.py
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  default:
+    name: faiss-mcp-network

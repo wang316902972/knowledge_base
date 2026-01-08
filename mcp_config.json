@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "faiss-vector-search": {
+      "command": "python3",
+      "args": [
+        "/usr/local/src/faiss-gpu/mcp_server.py"
+      ],
+      "env": {
+        "BUSINESS_ID": "default",
+        "FAISS_INDEX_TYPE": "FlatIP",
+        "EMBEDDING_MODEL": "paraphrase-multilingual-MiniLM-L12-v2",
+        "EMBEDDING_DIM": "384",
+        "ENABLE_SEARCH_OPTIMIZATION": "true",
+        "AUTO_SAVE": "true"
+      }
+    }
+  }
+}

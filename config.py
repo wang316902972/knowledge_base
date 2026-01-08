@@ -80,6 +80,7 @@ class Config:
     # GPU配置（如果需要）
     USE_GPU: bool = os.getenv("USE_GPU", "false").lower() == "true"
     GPU_ID: int = int(os.getenv("GPU_ID", "0"))
+    ENVIRONMENT: str = os.getenv("ENVIRONMENT", "production").lower()
     
     @classmethod
     def validate(cls):
@@ -138,20 +139,6 @@ class DevelopmentConfig(Config):
     RELEVANCE_THRESHOLD = 0.4  # 开发环境更宽松
     DIVERSITY_WEIGHT = 0.3
 
-# 测试环境配置示例
-class TestConfig(Config):
-    """测试环境配置"""
-    BUSINESS_ID = "test"
-    DATA_DIR = os.path.join(Config.SCRIPT_DIR, "test_data")
-    INDEX_TYPE = "FlatL2"
-    AUTO_SAVE = False
-    LOG_LEVEL = "DEBUG"
-    BATCH_SIZE = 8
-    MAX_BATCH_TEXTS = 10
-    ENABLE_SEARCH_OPTIMIZATION = False  # 测试环境禁用以简化
-    SEMANTIC_CHUNKING = False
-    RELEVANCE_THRESHOLD = 0.3
-    DIVERSITY_WEIGHT = 0.1
 
 # 根据环境变量选择配置
 def get_config() -> Config:
@@ -160,19 +147,5 @@ def get_config() -> Config:
     
     if env == "production":
         return ProductionConfig()
-    elif env == "test":
-        return TestConfig()
     else:
         return DevelopmentConfig()
-
-if __name__ == "__main__":
-    # 配置验证示例
-    try:
-        config = get_config()
-        config.validate()
-        print("✅ Configuration validation passed")
-        print(f"Environment: {os.getenv('ENVIRONMENT', 'development')}")
-        print(f"Index Type: {config.INDEX_TYPE}")
-        print(f"Model: {config.MODEL_NAME}")
-    except ValueError as e:
-        print(f"❌ Configuration validation failed: {e}")

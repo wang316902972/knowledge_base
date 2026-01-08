@@ -7,9 +7,10 @@ import uuid
 import asyncio
 import os
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Sequence
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from sentence_transformers import SentenceTransformer
 from config import get_config, Config
@@ -39,16 +40,40 @@ class FaissVectorDB:
     def _initialize(self):
         """初始化模型和索引"""
         try:
+            logger.info(f"环境: {self.config.ENVIRONMENT}")
             logger.info(f"业务ID: {self.config.BUSINESS_ID}")
             logger.info(f"数据目录: {self.config.DATA_DIR}")
             logger.info(f"索引文件: {self.config.INDEX_FILE}")
             logger.info(f"元数据文件: {self.config.METADATA_FILE}")
+            logger.info(f"是否使用GPU: {self.config.USE_GPU}")
+            logger.info(f"模型名称: {self.config.MODEL_NAME}")
 
             # 确保数据目录存在
             os.makedirs(self.config.DATA_DIR, exist_ok=True)
 
-            logger.info(f"正在加载嵌入模型: {self.config.MODEL_NAME}")
-            self.embedding_model = SentenceTransformer(self.config.MODEL_NAME)
+            # 优先尝试使用本地缓存的模型
+            try:
+                logger.info("尝试加载本地缓存的模型...")
+                self.embedding_model = SentenceTransformer(
+                    self.config.MODEL_NAME,
+                    local_files_only=True
+                )
+                logger.info("成功加载本地缓存的模型")
+            except Exception as e:
+                logger.warning(f"本地模型加载失败，尝试从网络下载: {e}")
+                # 读取 Hugging Face token（如果存在）
+                token = None
+                token_path = os.path.expanduser("~/.huggingface/token")
+                if os.path.exists(token_path):
+                    with open(token_path, 'r') as f:
+                        token = f.read().strip()
+                    logger.info("使用 Hugging Face token 进行认证")
+
+                # 加载模型，如果有 token 则传递
+                if token:
+                    self.embedding_model = SentenceTransformer(self.config.MODEL_NAME, token=token)
+                else:
+                    self.embedding_model = SentenceTransformer(self.config.MODEL_NAME)
 
             # 动态获取模型维度
             actual_dim = self.embedding_model.get_sentence_embedding_dimension()
@@ -263,19 +288,38 @@ class FaissVectorDB:
             # 增加搜索深度以提高精度
             self.index.hnsw.efSearch = max(self.config.EF_SEARCH, 100)
 
-        # 搜索，使用更大的候选集
-        search_k = min(top_k * 2, self.index.ntotal)
+        # 搜索，使用更大的候选集以提高精度
+        search_k = min(top_k * 4, self.index.ntotal)  # 增加候选数量
         distances, indices = self.index.search(query_embedding, search_k)
 
+        # 构建结果并添加基本的相关性过滤
         results = []
         for dist, idx in zip(distances[0], indices[0]):
             if idx != -1 and str(idx) in self.id_to_chunk:
-                results.append({
-                    "text": self.id_to_chunk[str(idx)],
-                    "score": float(dist),
-                    "faiss_id": int(idx),
-                    "search_method": "traditional"
-                })
+                # 处理可能的无效浮点值
+                score = float(dist)
+                if not (score == float('inf') or score == float('-inf') or score != score):  # 检查 inf, -inf, nan
+                    # 基本的文本相关性检查：确保查询词在结果中
+                    text = self.id_to_chunk[str(idx)]
+                    query_terms = set(query.lower().split())
+                    text_lower = text.lower()
+
+                    # 计算简单的文本匹配分数
+                    term_matches = sum(1 for term in query_terms if term in text_lower)
+                    text_relevance = term_matches / max(len(query_terms), 1)
+
+                    # 只有当有一定文本相关性时才添加结果
+                    if text_relevance > 0.1:  # 至少有一些词匹配
+                        results.append({
+                            "text": text,
+                            "score": score,
+                            "faiss_id": int(idx),
+                            "text_relevance": text_relevance,  # 添加文本相关性分数
+                            "search_method": "traditional"
+                        })
+
+        # 按向量和文本相关性综合排序
+        results.sort(key=lambda x: (x["score"], x["text_relevance"]), reverse=True)
 
         logger.info(f"传统搜索完成，返回 {len(results)} 个结果")
         return results[:top_k]
@@ -416,6 +460,19 @@ class FaissVectorDB:
         with self.lock:
             try:
                 if not hasattr(self, 'advanced_search_index'):
+                    logger.info("正在初始化AdvancedSearchIndex...")
+                    logger.info(f"Config type: {type(self.config)}")
+                    logger.info(f"Config attributes: {[attr for attr in dir(self.config) if not attr.startswith('_')]}")
+
+                    # 验证必要的配置属性
+                    required_attrs = ['MODEL_NAME', 'EMBEDDING_DIM', 'MIN_CHUNK_SIZE', 'MAX_CHUNK_SIZE']
+                    for attr in required_attrs:
+                        if not hasattr(self.config, attr):
+                            logger.error(f"Config missing required attribute: {attr}")
+                            return False
+                        else:
+                            logger.info(f"Config {attr}: {getattr(self.config, attr)}")
+
                     from search_optimization import AdvancedSearchIndex
                     self.advanced_search_index = AdvancedSearchIndex(self.config)
                     self.advanced_search_index.index = self.index
@@ -434,7 +491,9 @@ class FaissVectorDB:
                     logger.info("✅ 搜索优化已启用")
                     return True
             except Exception as e:
+                import traceback
                 logger.error(f"启用搜索优化失败: {e}")
+                logger.error(f"详细错误信息: {traceback.format_exc()}")
                 return False
 
     def get_search_recommendations(self) -> Dict[str, Any]:
@@ -484,18 +543,27 @@ class FaissVectorDB:
 
                 trad_avg_score = np.mean([r.get('score', 0) for r in traditional_results])
 
+                # 安全的浮点数转换函数
+                def safe_float(value):
+                    try:
+                        if value == float('inf') or value == float('-inf') or value != value:
+                            return 0.0
+                        return float(value)
+                    except (ValueError, TypeError):
+                        return 0.0
+
                 quality_results.append({
                     "query": query,
-                    "traditional_avg_score": float(trad_avg_score),
-                    "optimized_avg_score": float(opt_avg_score),
-                    "improvement": float(opt_avg_score - trad_avg_score)
+                    "traditional_avg_score": safe_float(trad_avg_score),
+                    "optimized_avg_score": safe_float(opt_avg_score),
+                    "improvement": safe_float(opt_avg_score - trad_avg_score)
                 })
 
             overall_improvement = np.mean([r["improvement"] for r in quality_results])
 
             return {
                 "test_queries_count": len(test_queries),
-                "overall_improvement": float(overall_improvement),
+                "overall_improvement": safe_float(overall_improvement),
                 "detailed_results": quality_results,
                 "optimization_enabled": hasattr(self, 'advanced_search_index')
             }
@@ -525,10 +593,19 @@ async def lifespan(app: FastAPI):
 
 # 创建FastAPI应用
 app = FastAPI(
-    title="FAISS向量数据库API",
-    description="优化的FAISS向量数据库服务",
+    title="FAISS向量数据库API (MCP集成版)",
+    description="优化的FAISS向量数据库服务，支持MCP协议和传统REST API",
     version="2.0.0",
     lifespan=lifespan
+)
+
+# 添加 CORS 支持
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # 请求模型
@@ -549,13 +626,491 @@ class Query(BaseModel):
     use_optimization: bool = Field(default=True, description="是否使用搜索优化")
 
 class BenchmarkQueries(BaseModel):
-    queries: List[str] = Field(..., description="测试查询列表", max_items=20)
+    queries: List[str] = Field(..., description="测试查询列表", max_length=20)
 
 class BatchTexts(BaseModel):
-    texts: List[str] = Field(..., description="批量文本列表", max_items=100)
+    texts: List[str] = Field(..., description="批量文本列表", max_length=100)
 
-# API端点
-@app.post("/add", summary="添加文档")
+
+# ============================================================================
+# MCP 协议模型定义
+# ============================================================================
+
+class MCPTool(BaseModel):
+    """MCP 工具定义"""
+    name: str
+    description: str
+    inputSchema: Dict[str, Any]
+
+
+class MCPToolsListResponse(BaseModel):
+    """工具列表响应"""
+    tools: List[MCPTool]
+
+
+class MCPCallToolRequest(BaseModel):
+    """调用工具请求"""
+    name: str
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+
+
+class MCPContent(BaseModel):
+    """MCP 内容"""
+    type: str
+    text: str
+
+
+class MCPCallToolResponse(BaseModel):
+    """调用工具响应"""
+    content: List[MCPContent]
+    isError: bool = False
+
+
+class MCPInitializeRequest(BaseModel):
+    """初始化请求"""
+    protocolVersion: str = "2024-11-05"
+    capabilities: Dict[str, Any] = Field(default_factory=dict)
+    clientInfo: Dict[str, str] = Field(default_factory=dict)
+
+
+class MCPInitializeResponse(BaseModel):
+    """初始化响应"""
+    protocolVersion: str = "2024-11-05"
+    capabilities: Dict[str, Any]
+    serverInfo: Dict[str, str]
+
+
+# ============================================================================
+# MCP 工具定义和执行函数
+# ============================================================================
+
+def get_mcp_tools() -> List[MCPTool]:
+    """获取所有 MCP 工具定义"""
+    return [
+        MCPTool(
+            name="search_knowledge",
+            description="在向量数据库中搜索相关知识。支持语义搜索和优化搜索模式。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "搜索查询文本，支持自然语言问题"
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "返回的最相关结果数量（1-50）",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 50
+                    },
+                    "use_optimization": {
+                        "type": "boolean",
+                        "description": "是否使用优化搜索（包括多样性重排序、相关性过滤等）",
+                        "default": True
+                    }
+                },
+                "required": ["query"]
+            }
+        ),
+        MCPTool(
+            name="add_document",
+            description="将文档添加到向量数据库。文档会自动分块并生成向量索引。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "要添加的文档内容"
+                    },
+                    "chunk_size": {
+                        "type": "integer",
+                        "description": "文本分块大小（字符数）",
+                        "default": 500,
+                        "minimum": 50,
+                        "maximum": 2000
+                    },
+                    "chunk_overlap": {
+                        "type": "integer",
+                        "description": "分块之间的重叠字符数",
+                        "default": 50,
+                        "minimum": 0,
+                        "maximum": 500
+                    }
+                },
+                "required": ["content"]
+            }
+        ),
+        MCPTool(
+            name="delete_document",
+            description="从向量数据库中删除指定文档。需要提供与添加时相同的内容和分块参数。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "要删除的文档内容"
+                    },
+                    "chunk_size": {
+                        "type": "integer",
+                        "description": "文本分块大小（需与添加时一致）",
+                        "default": 500,
+                        "minimum": 50,
+                        "maximum": 2000
+                    },
+                    "chunk_overlap": {
+                        "type": "integer",
+                        "description": "分块重叠（需与添加时一致）",
+                        "default": 50,
+                        "minimum": 0,
+                        "maximum": 500
+                    }
+                },
+                "required": ["content"]
+            }
+        ),
+        MCPTool(
+            name="batch_add_texts",
+            description="批量添加多个文本到向量数据库。适用于一次性添加多个独立的文本片段。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "texts": {
+                        "type": "array",
+                        "description": "要添加的文本列表",
+                        "items": {
+                            "type": "string"
+                        },
+                        "maxItems": 100
+                    }
+                },
+                "required": ["texts"]
+            }
+        ),
+        MCPTool(
+            name="get_stats",
+            description="获取向量数据库的统计信息，包括向量数量、索引类型、优化状态等。",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
+        ),
+        MCPTool(
+            name="enable_optimization",
+            description="启用高级搜索优化功能，包括语义分块、多样性重排序等。",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
+        ),
+        MCPTool(
+            name="get_recommendations",
+            description="获取针对当前数据量和索引类型的搜索优化建议。",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
+        ),
+        MCPTool(
+            name="save_index",
+            description="手动保存当前的向量索引到磁盘。",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
+        )
+    ]
+
+
+async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> MCPCallToolResponse:
+    """执行 MCP 工具调用"""
+    global vector_db
+    
+    if vector_db is None:
+        return MCPCallToolResponse(
+            content=[MCPContent(
+                type="text",
+                text=json.dumps({"error": "向量数据库未初始化"}, ensure_ascii=False)
+            )],
+            isError=True
+        )
+    
+    try:
+        if name == "search_knowledge":
+            # 搜索知识
+            query = arguments.get("query")
+            top_k = arguments.get("top_k", 5)
+            use_optimization = arguments.get("use_optimization", True)
+            
+            if not query:
+                raise ValueError("query parameter is required")
+            
+            if vector_db.index.ntotal == 0:
+                return MCPCallToolResponse(
+                    content=[MCPContent(
+                        type="text",
+                        text=json.dumps({
+                            "relevant_chunks": [],
+                            "message": "知识库为空，请先添加文档",
+                            "total_found": 0
+                        }, ensure_ascii=False, indent=2)
+                    )]
+                )
+            
+            results = vector_db.search(query, top_k, use_optimization)
+            search_method = "optimized" if use_optimization and hasattr(vector_db, 'advanced_search_index') else "traditional"
+            
+            response = {
+                "relevant_chunks": [result["text"] for result in results],
+                "detailed_results": results,
+                "query": query,
+                "total_found": len(results),
+                "search_method": search_method,
+                "optimization_enabled": use_optimization
+            }
+            
+            return MCPCallToolResponse(
+                content=[MCPContent(
+                    type="text",
+                    text=json.dumps(response, ensure_ascii=False, indent=2)
+                )]
+            )
+        
+        elif name == "add_document":
+            # 添加文档
+            content = arguments.get("content")
+            chunk_size = arguments.get("chunk_size", 500)
+            chunk_overlap = arguments.get("chunk_overlap", 50)
+            
+            if not content:
+                raise ValueError("content parameter is required")
+            
+            chunks = vector_db._generate_chunks(content, chunk_size, chunk_overlap)
+            
+            if not chunks:
+                return MCPCallToolResponse(
+                    content=[MCPContent(
+                        type="text",
+                        text=json.dumps({
+                            "error": "文档内容过短，无法生成有效分块"
+                        }, ensure_ascii=False)
+                    )],
+                    isError=True
+                )
+            
+            ids = vector_db.add_texts(chunks)
+            
+            if config.AUTO_SAVE:
+                vector_db.save()
+            
+            response = {
+                "message": f"文档处理成功，新增 {len(chunks)} 个知识块",
+                "total_vectors": vector_db.index.ntotal,
+                "chunks_added": len(chunks),
+                "chunk_ids": ids[:5] if len(ids) > 5 else ids
+            }
+            
+            return MCPCallToolResponse(
+                content=[MCPContent(
+                    type="text",
+                    text=json.dumps(response, ensure_ascii=False, indent=2)
+                )]
+            )
+        
+        elif name == "delete_document":
+            # 删除文档
+            content = arguments.get("content")
+            chunk_size = arguments.get("chunk_size", 500)
+            chunk_overlap = arguments.get("chunk_overlap", 50)
+            
+            if not content:
+                raise ValueError("content parameter is required")
+            
+            chunks = vector_db._generate_chunks(content, chunk_size, chunk_overlap)
+            
+            if not chunks:
+                return MCPCallToolResponse(
+                    content=[MCPContent(
+                        type="text",
+                        text=json.dumps({
+                            "error": "文档内容过短，无法生成有效分块"
+                        }, ensure_ascii=False)
+                    )],
+                    isError=True
+                )
+            
+            deleted_count = vector_db.delete_texts(chunks)
+            
+            if config.AUTO_SAVE and deleted_count > 0:
+                vector_db.save()
+            
+            response = {
+                "message": f"成功删除 {deleted_count} 个知识块",
+                "total_vectors": vector_db.index.ntotal,
+                "deleted_count": deleted_count
+            }
+            
+            return MCPCallToolResponse(
+                content=[MCPContent(
+                    type="text",
+                    text=json.dumps(response, ensure_ascii=False, indent=2)
+                )]
+            )
+        
+        elif name == "batch_add_texts":
+            # 批量添加文本
+            texts = arguments.get("texts", [])
+            
+            if not texts:
+                raise ValueError("texts parameter is required")
+            
+            if len(texts) > 100:
+                raise ValueError("Maximum 100 texts allowed per batch")
+            
+            ids = vector_db.add_texts(texts)
+            
+            if config.AUTO_SAVE:
+                vector_db.save()
+            
+            response = {
+                "message": f"批量添加成功，新增 {len(texts)} 个文本",
+                "total_vectors": vector_db.index.ntotal,
+                "added_count": len(ids)
+            }
+            
+            return MCPCallToolResponse(
+                content=[MCPContent(
+                    type="text",
+                    text=json.dumps(response, ensure_ascii=False, indent=2)
+                )]
+            )
+        
+        elif name == "get_stats":
+            # 获取统计信息
+            stats = vector_db.get_stats()
+            
+            return MCPCallToolResponse(
+                content=[MCPContent(
+                    type="text",
+                    text=json.dumps(stats, ensure_ascii=False, indent=2)
+                )]
+            )
+        
+        elif name == "enable_optimization":
+            # 启用搜索优化
+            success = vector_db.enable_search_optimization()
+            
+            if success:
+                response = {
+                    "message": "搜索优化已成功启用",
+                    "features": [
+                        "语义感知文本分块",
+                        "动态搜索参数调整",
+                        "多样性重排序(MMR)",
+                        "搜索质量评估",
+                        "相关性阈值过滤"
+                    ]
+                }
+            else:
+                response = {
+                    "error": "启用搜索优化失败"
+                }
+            
+            return MCPCallToolResponse(
+                content=[MCPContent(
+                    type="text",
+                    text=json.dumps(response, ensure_ascii=False, indent=2)
+                )],
+                isError=not success
+            )
+        
+        elif name == "get_recommendations":
+            # 获取搜索建议
+            recommendations = vector_db.get_search_recommendations()
+            
+            return MCPCallToolResponse(
+                content=[MCPContent(
+                    type="text",
+                    text=json.dumps(recommendations, ensure_ascii=False, indent=2)
+                )]
+            )
+        
+        elif name == "save_index":
+            # 手动保存
+            vector_db.save()
+            
+            response = {
+                "message": "索引保存成功",
+                "total_vectors": vector_db.index.ntotal
+            }
+            
+            return MCPCallToolResponse(
+                content=[MCPContent(
+                    type="text",
+                    text=json.dumps(response, ensure_ascii=False, indent=2)
+                )]
+            )
+        
+        else:
+            raise ValueError(f"Unknown tool: {name}")
+    
+    except Exception as e:
+        logger.error(f"Tool execution error: {e}")
+        return MCPCallToolResponse(
+            content=[MCPContent(
+                type="text",
+                text=json.dumps({
+                    "error": str(e),
+                    "tool": name
+                }, ensure_ascii=False)
+            )],
+            isError=True
+        )
+
+
+# ============================================================================
+# MCP 协议端点
+# ============================================================================
+
+@app.post("/mcp/initialize", response_model=MCPInitializeResponse, tags=["MCP"])
+async def mcp_initialize(request: MCPInitializeRequest):
+    """MCP 初始化"""
+    logger.info(f"MCP 初始化请求: {request.dict()}")
+    
+    return MCPInitializeResponse(
+        protocolVersion="2024-11-05",
+        capabilities={
+            "tools": {},
+            "resources": {}
+        },
+        serverInfo={
+            "name": "faiss-vector-search",
+            "version": "2.0.0"
+        }
+    )
+
+
+@app.get("/mcp/tools", response_model=MCPToolsListResponse, tags=["MCP"])
+async def mcp_list_tools():
+    """列出所有可用工具"""
+    tools = get_mcp_tools()
+    return MCPToolsListResponse(tools=tools)
+
+
+@app.post("/mcp/tools/call", response_model=MCPCallToolResponse, tags=["MCP"])
+async def mcp_call_tool(request: MCPCallToolRequest):
+    """调用工具"""
+    logger.info(f"MCP调用工具: {request.name}, 参数: {request.arguments}")
+    
+    response = await execute_mcp_tool(request.name, request.arguments)
+    return response
+
+
+# ============================================================================
+# 传统 REST API 端点
+# ============================================================================
+
+@app.post("/add", summary="添加文档", tags=["传统API"])
 async def add_document(doc: Document, background_tasks: BackgroundTasks):
     """添加文档到知识库"""
     try:
@@ -587,7 +1142,7 @@ async def add_document(doc: Document, background_tasks: BackgroundTasks):
         logger.error(f"添加文档失败: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
-@app.post("/batch_add", summary="批量添加文本")
+@app.post("/batch_add", summary="批量添加文本", tags=["传统API"])
 async def batch_add_texts(batch: BatchTexts, background_tasks: BackgroundTasks):
     """批量添加文本"""
     try:
@@ -611,7 +1166,7 @@ async def batch_add_texts(batch: BatchTexts, background_tasks: BackgroundTasks):
         logger.error(f"批量添加失败: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
-@app.delete("/delete", summary="删除文档")
+@app.delete("/delete", summary="删除文档", tags=["传统API"])
 async def delete_document(doc: Document, background_tasks: BackgroundTasks):
     """精确删除文档"""
     try:
@@ -641,7 +1196,7 @@ async def delete_document(doc: Document, background_tasks: BackgroundTasks):
         logger.error(f"删除文档失败: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
-@app.post("/search", summary="搜索知识")
+@app.post("/search", summary="搜索知识", tags=["传统API"])
 async def search_knowledge(query: Query):
     """搜索相关知识"""
     try:
@@ -671,7 +1226,7 @@ async def search_knowledge(query: Query):
         logger.error(f"搜索失败: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
-@app.post("/save", summary="手动保存")
+@app.post("/save", summary="手动保存", tags=["传统API"])
 async def manual_save():
     """手动保存索引和元数据"""
     try:
@@ -687,7 +1242,7 @@ async def manual_save():
         logger.error(f"保存失败: {e}")
         raise HTTPException(status_code=500, detail="保存失败")
 
-@app.get("/stats", summary="获取统计信息")
+@app.get("/stats", summary="获取统计信息", tags=["传统API"])
 async def get_stats():
     """获取数据库统计信息"""
     try:
@@ -700,7 +1255,7 @@ async def get_stats():
         logger.error(f"获取统计信息失败: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
-@app.post("/enable_optimization", summary="启用搜索优化")
+@app.post("/enable_optimization", summary="启用搜索优化", tags=["传统API"])
 async def enable_search_optimization():
     """启用搜索优化功能"""
     try:
@@ -728,7 +1283,7 @@ async def enable_search_optimization():
         logger.error(f"启用搜索优化失败: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
-@app.get("/search_recommendations", summary="获取搜索优化建议")
+@app.get("/search_recommendations", summary="获取搜索优化建议", tags=["传统API"])
 async def get_search_recommendations():
     """获取针对当前数据量的搜索优化建议"""
     try:
@@ -744,7 +1299,7 @@ async def get_search_recommendations():
         logger.error(f"获取搜索建议失败: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
-@app.post("/benchmark_search_quality", summary="搜索质量基准测试")
+@app.post("/benchmark_search_quality", summary="搜索质量基准测试", tags=["传统API"])
 async def benchmark_search_quality(benchmark: BenchmarkQueries):
     """对比传统搜索和优化搜索的质量差异"""
     try:
@@ -760,12 +1315,19 @@ async def benchmark_search_quality(benchmark: BenchmarkQueries):
         logger.error(f"基准测试失败: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
-@app.get("/health", summary="健康检查")
+@app.get("/health", summary="健康检查", tags=["系统"])
 async def health_check():
     """健康检查端点"""
     return {
         "status": "healthy" if vector_db else "initializing",
-        "timestamp": "2024-01-01T00:00:00Z"  # 实际应用中使用当前时间
+        "mcp_enabled": True,
+        "mcp_protocol_version": "2024-11-05",
+        "api_version": "2.0.0",
+        "features": {
+            "mcp_protocol": True,
+            "rest_api": True,
+            "search_optimization": hasattr(vector_db, 'advanced_search_index') if vector_db else False
+        }
     }
 
 if __name__ == "__main__":

@@ -8,14 +8,11 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      - .:/app
     environment:
       - ENVIRONMENT=production
       - BUSINESS_ID=default
       - SERVICE_NAME=faiss-vector-db-default
-      - FAISS_INDEX_TYPE=HNSW
-      - AUTO_SAVE=true
-      - LOG_LEVEL=INFO
-      - BATCH_SIZE=32
       - API_HOST=0.0.0.0
       - API_PORT=8001
     restart: unless-stopped
@@ -30,6 +27,7 @@ services:
   #   volumes:
   #     - ./data:/app/data
   #     - ./logs:/app/logs
+  #     - .:/app
   #   environment:
   #     - ENVIRONMENT=production
   #     - BUSINESS_ID=document
