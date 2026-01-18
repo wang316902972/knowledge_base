@@ -13,12 +13,10 @@ from mcp.types import (
     TextContent,
     ImageContent,
     EmbeddedResource,
-    INVALID_PARAMS,
-    INTERNAL_ERROR,
 )
-from pydantic import BaseModel, Field, AnyUrl
+from pydantic import BaseModel, Field
 
-from config import get_config, Config
+from config import get_config
 from faiss_server_optimized import FaissVectorDB
 
 # 配置日志
@@ -65,11 +63,25 @@ mcp_server = Server("faiss-vector-search")
 
 @mcp_server.list_tools()
 async def list_tools() -> list[Tool]:
-    """列出所有可用的工具"""
+    """列出所有可用的工具
+
+    所有工具都支持可选的 businesstype 参数，用于指定业务类型。
+    默认使用环境变量 BUINESSTYPE 或 'default' 作为业务类型。
+    """
+    default_bt = config.DEFAULT_BUSINESSTYPE
+
     return [
         Tool(
             name="search_knowledge",
-            description="在向量数据库中搜索相关知识。支持语义搜索和优化搜索模式。",
+            description=f"""在向量数据库中搜索相关知识。支持语义搜索和优化搜索模式。
+
+默认业务类型: {default_bt}
+
+功能特性:
+- 语义向量搜索
+- 可配置返回结果数量 (top_k)
+- 搜索优化选项（多样性重排序、相关性过滤）
+- 支持业务类型隔离的独立索引""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -88,6 +100,10 @@ async def list_tools() -> list[Tool]:
                         "type": "boolean",
                         "description": "是否使用优化搜索（包括多样性重排序、相关性过滤等）",
                         "default": True
+                    },
+                    "businesstype": {
+                        "type": "string",
+                        "description": "业务类型标识符（可选，默认使用环境变量配置）"
                     }
                 },
                 "required": ["query"]
@@ -95,7 +111,15 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="add_document",
-            description="将文档添加到向量数据库。文档会自动分块并生成向量索引。",
+            description=f"""将文档添加到向量数据库。文档会自动分块并生成向量索引。
+
+默认业务类型: {default_bt}
+
+功能特性:
+- 自动文本分块（可配置大小和重叠）
+- 向量化和索引生成
+- 支持业务类型隔离的独立索引
+- 自动保存选项（可配置）""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -116,6 +140,10 @@ async def list_tools() -> list[Tool]:
                         "default": 50,
                         "minimum": 0,
                         "maximum": 500
+                    },
+                    "businesstype": {
+                        "type": "string",
+                        "description": "业务类型标识符（可选，默认使用环境变量配置）"
                     }
                 },
                 "required": ["content"]
@@ -123,7 +151,14 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="delete_document",
-            description="从向量数据库中删除指定文档。需要提供与添加时相同的内容和分块参数。",
+            description=f"""从向量数据库中删除指定文档。需要提供与添加时相同的内容和分块参数。
+
+默认业务类型: {default_bt}
+
+功能特性:
+- 精确匹配文档删除
+- 需要提供与添加时相同的分块参数
+- 支持业务类型隔离的独立索引""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -144,59 +179,35 @@ async def list_tools() -> list[Tool]:
                         "default": 50,
                         "minimum": 0,
                         "maximum": 500
+                    },
+                    "businesstype": {
+                        "type": "string",
+                        "description": "业务类型标识符（可选，默认使用环境变量配置）"
                     }
                 },
                 "required": ["content"]
             }
         ),
         Tool(
-            name="batch_add_texts",
-            description="批量添加多个文本到向量数据库。适用于一次性添加多个独立的文本片段。",
+            name="get_stats",
+            description=f"""获取向量数据库的统计信息，包括向量数量、索引类型、优化状态等。
+
+默认业务类型: {default_bt}
+
+返回信息:
+- 向量总数
+- 索引类型和配置
+- 模型信息
+- 优化状态
+- 业务类型路径""",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "texts": {
-                        "type": "array",
-                        "description": "要添加的文本列表",
-                        "items": {
-                            "type": "string"
-                        },
-                        "maxItems": 100
+                    "businesstype": {
+                        "type": "string",
+                        "description": "业务类型标识符（可选，默认使用环境变量配置）"
                     }
-                },
-                "required": ["texts"]
-            }
-        ),
-        Tool(
-            name="get_stats",
-            description="获取向量数据库的统计信息，包括向量数量、索引类型、优化状态等。",
-            inputSchema={
-                "type": "object",
-                "properties": {}
-            }
-        ),
-        Tool(
-            name="enable_optimization",
-            description="启用高级搜索优化功能，包括语义分块、多样性重排序等。",
-            inputSchema={
-                "type": "object",
-                "properties": {}
-            }
-        ),
-        Tool(
-            name="get_recommendations",
-            description="获取针对当前数据量和索引类型的搜索优化建议。",
-            inputSchema={
-                "type": "object",
-                "properties": {}
-            }
-        ),
-        Tool(
-            name="save_index",
-            description="手动保存当前的向量索引到磁盘。",
-            inputSchema={
-                "type": "object",
-                "properties": {}
+                }
             }
         )
     ]
@@ -206,10 +217,13 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: Any) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
     """处理工具调用"""
     global vector_db
-    
+
+    # 提取 business type 用于日志记录
+    businesstype = arguments.get("businesstype", config.DEFAULT_BUSINESSTYPE)
+
     # 确保向量数据库已初始化
     if vector_db is None:
-        logger.info("初始化向量数据库...")
+        logger.info(f"[{businesstype}] 初始化向量数据库...")
         vector_db = FaissVectorDB(config)
     
     try:
@@ -218,9 +232,12 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent | ImageCo
             query = arguments.get("query")
             top_k = arguments.get("top_k", 5)
             use_optimization = arguments.get("use_optimization", True)
-            
+
             if not query:
                 raise ValueError("query parameter is required")
+
+            # 记录搜索日志
+            logger.info(f"[{businesstype}] 🔍 搜索请求 | Query: {query[:100]}{'...' if len(query) > 100 else ''} | top_k: {top_k} | optimization: {use_optimization}")
             
             if vector_db.index.ntotal == 0:
                 return [TextContent(
@@ -232,19 +249,35 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent | ImageCo
                     }, ensure_ascii=False, indent=2)
                 )]
             
-            results = vector_db.search(query, top_k, use_optimization)
-            
+            results = vector_db.search(query, top_k, use_optimization, use_enhanced=True)
+
+            # 记录搜索结果日志
+            logger.info(f"[{businesstype}] ✅ 搜索完成 | 找到 {len(results)} 个结果")
+
             # 添加搜索方法信息
-            search_method = "optimized" if use_optimization and hasattr(vector_db, 'advanced_search_index') else "traditional"
-            
+            search_method = results[0].get("search_method", "unknown") if results else "unknown"
+
+            # 提取质量指标（如果有）
+            quality_metrics = None
+            if results and "quality_metrics" in results[0]:
+                quality_metrics = results[0]["quality_metrics"]
+                logger.info(f"[{businesstype}] 📊 质量指标 | avg_relevance: {quality_metrics.get('avg_relevance_score', 0):.3f} | "
+                           f"diversity: {quality_metrics.get('diversity_score', 0):.3f} | "
+                           f"coverage: {quality_metrics.get('coverage_ratio', 0):.3f}")
+
             response = {
                 "relevant_chunks": [result["text"] for result in results],
                 "detailed_results": results,
                 "query": query,
                 "total_found": len(results),
                 "search_method": search_method,
-                "optimization_enabled": use_optimization
+                "optimization_enabled": use_optimization,
+                "enhanced_search_enabled": True
             }
+
+            # 添加质量指标到响应
+            if quality_metrics:
+                response["quality_metrics"] = quality_metrics
             
             return [TextContent(
                 type="text",
@@ -256,10 +289,14 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent | ImageCo
             content = arguments.get("content")
             chunk_size = arguments.get("chunk_size", 500)
             chunk_overlap = arguments.get("chunk_overlap", 50)
-            
+
             if not content:
                 raise ValueError("content parameter is required")
-            
+
+            # 记录添加文档日志
+            content_preview = content[:150].replace('\n', ' ') + '...' if len(content) > 150 else content.replace('\n', ' ')
+            logger.info(f"[{businesstype}] 📝 添加文档 | Content: {content_preview} | chunk_size: {chunk_size} | chunk_overlap: {chunk_overlap}")
+
             # 文本分块
             chunks = vector_db._generate_chunks(content, chunk_size, chunk_overlap)
             
@@ -273,7 +310,10 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent | ImageCo
             
             # 添加到索引
             ids = vector_db.add_texts(chunks)
-            
+
+            # 记录添加成功日志
+            logger.info(f"[{businesstype}] ✅ 文档添加成功 | 新增 {len(chunks)} 个知识块 | 总向量数: {vector_db.index.ntotal}")
+
             # 自动保存
             if config.AUTO_SAVE:
                 vector_db.save()
@@ -295,10 +335,14 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent | ImageCo
             content = arguments.get("content")
             chunk_size = arguments.get("chunk_size", 500)
             chunk_overlap = arguments.get("chunk_overlap", 50)
-            
+
             if not content:
                 raise ValueError("content parameter is required")
-            
+
+            # 记录删除文档日志
+            content_preview = content[:150].replace('\n', ' ') + '...' if len(content) > 150 else content.replace('\n', ' ')
+            logger.info(f"[{businesstype}] 🗑️ 删除文档 | Content: {content_preview}")
+
             # 重新生成相同的分块来精确匹配
             chunks = vector_db._generate_chunks(content, chunk_size, chunk_overlap)
             
@@ -326,96 +370,22 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent | ImageCo
                 type="text",
                 text=json.dumps(response, ensure_ascii=False, indent=2)
             )]
-        
-        elif name == "batch_add_texts":
-            # 批量添加文本
-            texts = arguments.get("texts", [])
-            
-            if not texts:
-                raise ValueError("texts parameter is required")
-            
-            if len(texts) > 100:
-                raise ValueError("Maximum 100 texts allowed per batch")
-            
-            ids = vector_db.add_texts(texts)
-            
-            # 自动保存
-            if config.AUTO_SAVE:
-                vector_db.save()
-            
-            response = {
-                "message": f"批量添加成功，新增 {len(texts)} 个文本",
-                "total_vectors": vector_db.index.ntotal,
-                "added_count": len(ids)
-            }
-            
-            return [TextContent(
-                type="text",
-                text=json.dumps(response, ensure_ascii=False, indent=2)
-            )]
-        
+
         elif name == "get_stats":
             # 获取统计信息
+            logger.info(f"[{businesstype}] 📊 获取统计信息")
             stats = vector_db.get_stats()
             
             return [TextContent(
                 type="text",
                 text=json.dumps(stats, ensure_ascii=False, indent=2)
             )]
-        
-        elif name == "enable_optimization":
-            # 启用搜索优化
-            success = vector_db.enable_search_optimization()
-            
-            if success:
-                response = {
-                    "message": "搜索优化已成功启用",
-                    "features": [
-                        "语义感知文本分块",
-                        "动态搜索参数调整",
-                        "多样性重排序(MMR)",
-                        "搜索质量评估",
-                        "相关性阈值过滤"
-                    ]
-                }
-            else:
-                response = {
-                    "error": "启用搜索优化失败"
-                }
-            
-            return [TextContent(
-                type="text",
-                text=json.dumps(response, ensure_ascii=False, indent=2)
-            )]
-        
-        elif name == "get_recommendations":
-            # 获取搜索建议
-            recommendations = vector_db.get_search_recommendations()
-            
-            return [TextContent(
-                type="text",
-                text=json.dumps(recommendations, ensure_ascii=False, indent=2)
-            )]
-        
-        elif name == "save_index":
-            # 手动保存
-            vector_db.save()
-            
-            response = {
-                "message": "索引保存成功",
-                "total_vectors": vector_db.index.ntotal
-            }
-            
-            return [TextContent(
-                type="text",
-                text=json.dumps(response, ensure_ascii=False, indent=2)
-            )]
-        
+
         else:
             raise ValueError(f"Unknown tool: {name}")
     
     except Exception as e:
-        logger.error(f"Tool execution error: {e}")
+        logger.error(f"[{businesstype}] ❌ 工具执行错误 | Tool: {name} | Error: {e}")
         return [TextContent(
             type="text",
             text=json.dumps({
@@ -427,10 +397,13 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent | ImageCo
 
 async def main():
     """运行 MCP 服务器"""
-    logger.info("启动 FAISS Vector Database MCP Server...")
-    logger.info(f"业务ID: {config.BUSINESS_ID}")
-    logger.info(f"索引类型: {config.INDEX_TYPE}")
-    logger.info(f"模型: {config.MODEL_NAME}")
+    logger.info("=" * 60)
+    logger.info("🚀 启动 FAISS Vector Database MCP Server...")
+    logger.info(f"📋 Business Type: {config.DEFAULT_BUSINESSTYPE}")
+    logger.info(f"📊 索引类型: {config.INDEX_TYPE}")
+    logger.info(f"🤖 模型: {config.MODEL_NAME}")
+    logger.info(f"📁 数据目录: {config.DATA_DIR}")
+    logger.info("=" * 60)
     
     async with stdio_server() as (read_stream, write_stream):
         await mcp_server.run(

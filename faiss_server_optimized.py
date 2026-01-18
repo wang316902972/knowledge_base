@@ -16,6 +16,12 @@ from pydantic import BaseModel, Field, field_validator
 from sentence_transformers import SentenceTransformer
 from config import get_config, Config
 from search_optimization import AdvancedSearchIndex, QualityMetrics
+from retrieval_enhancement import (
+    RetrievalEnhancementCoordinator,
+    EnhancedQuery,
+    SearchResult,
+    QualityMetrics as EnhancedQualityMetrics
+)
 
 # 配置日志
 logging.basicConfig(
@@ -274,8 +280,20 @@ class FaissVectorDB:
                 logger.error(f"添加文本失败: {e}")
                 raise HTTPException(status_code=500, detail=f"添加文本失败: {str(e)}")
     
-    def search(self, query: str, top_k: int = 5, use_optimization: bool = True) -> List[Dict[str, Any]]:
-        """搜索相似文本 - 支持优化模式"""
+    def search(self, query: str, top_k: int = 5, use_optimization: bool = True,
+             use_enhanced: bool = True) -> List[Dict[str, Any]]:
+        """
+        搜索相似文本 - 支持优化模式和增强检索
+
+        Args:
+            query: Search query text
+            top_k: Number of results to return
+            use_optimization: Use advanced search optimization
+            use_enhanced: Use new enhanced retrieval with adaptive thresholding
+
+        Returns:
+            List of search results
+        """
         with self.lock:
             try:
                 if self.index.ntotal == 0:
@@ -285,6 +303,10 @@ class FaissVectorDB:
                 if hasattr(self.index, 'is_trained') and not self.index.is_trained:
                     logger.warning("IVF索引尚未训练，无法进行搜索")
                     return []
+
+                # 优先使用增强检索（如果启用）
+                if use_enhanced and self.config.ENABLE_ADAPTIVE_THRESHOLD:
+                    return self.enhanced_search(query, top_k)
 
                 # 使用优化的搜索方法
                 if use_optimization and hasattr(self, 'advanced_search_index'):
@@ -350,6 +372,268 @@ class FaissVectorDB:
         results.sort(key=lambda x: (x["score"], x["text_relevance"]), reverse=True)
 
         logger.info(f"传统搜索完成，返回 {len(results)} 个结果")
+        return results[:top_k]
+
+    def enhanced_search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """
+        Enhanced search with adaptive thresholding, query expansion, and hybrid retrieval
+
+        Args:
+            query: Search query text
+            top_k: Number of results to return
+
+        Returns:
+            List of search results with enhanced metadata
+        """
+        try:
+            # Initialize enhancement coordinator if not already initialized
+            if not hasattr(self, 'enhancement_coordinator'):
+                self.enhancement_coordinator = RetrievalEnhancementCoordinator(
+                    self.config, self.embedding_model, self.businesstype
+                )
+
+            coordinator = self.enhancement_coordinator
+
+            # Step 1: Enhance query
+            enhanced_query = coordinator.enhance_query(query)
+            logger.info(f"Query enhanced: {len(enhanced_query.expanded_variants)} variants, "
+                       f"domain terms: {enhanced_query.domain_terms}")
+
+            # Step 2: Execute vector search with expanded queries
+            all_results = {}  # faiss_id -> SearchResult
+
+            # Search with original query
+            vector_results = self._execute_vector_search(query, top_k * 3)
+            for result_dict in vector_results:
+                faiss_id = result_dict['faiss_id']
+                all_results[faiss_id] = SearchResult(
+                    text=result_dict['text'],
+                    similarity_score=result_dict.get('similarity_score', result_dict.get('score', 0.0)),
+                    relevance_score=result_dict.get('relevance_score', result_dict.get('score', 0.0)),
+                    faiss_id=faiss_id,
+                    match_type='vector',
+                    strategies_used=['vector']
+                )
+
+            # Search with expanded queries (if enabled and domain terms detected)
+            if (self.config.ENABLE_QUERY_EXPANSION and
+                enhanced_query.expanded_variants and
+                enhanced_query.metadata.get('has_domain_terms', False)):
+
+                for expanded_query in enhanced_query.expanded_variants[:3]:  # Use top 3
+                    expanded_results = self._execute_vector_search(expanded_query, top_k)
+                    for result_dict in expanded_results:
+                        faiss_id = result_dict['faiss_id']
+                        if faiss_id in all_results:
+                            # Update strategies_used
+                            if 'vector_expanded' not in all_results[faiss_id].strategies_used:
+                                all_results[faiss_id].strategies_used.append('vector_expanded')
+                        else:
+                            all_results[faiss_id] = SearchResult(
+                                text=result_dict['text'],
+                                similarity_score=result_dict.get('similarity_score', result_dict.get('score', 0.0)),
+                                relevance_score=result_dict.get('relevance_score', result_dict.get('score', 0.0)),
+                                faiss_id=faiss_id,
+                                match_type='vector',
+                                strategies_used=['vector_expanded']
+                            )
+
+            # Step 3: Apply exact field matching as fallback (if enabled)
+            if self.config.ENABLE_EXACT_MATCH_FALLBACK and len(all_results) < top_k:
+                exact_results = self._execute_exact_match_search(query, top_k)
+                for result_dict in exact_results:
+                    faiss_id = result_dict['faiss_id']
+                    if faiss_id in all_results:
+                        if 'exact' not in all_results[faiss_id].strategies_used:
+                            all_results[faiss_id].strategies_used.append('exact')
+                    else:
+                        all_results[faiss_id] = SearchResult(
+                            text=result_dict['text'],
+                            similarity_score=result_dict['score'],
+                            relevance_score=result_dict['score'],
+                            faiss_id=faiss_id,
+                            match_type='exact',
+                            strategies_used=['exact']
+                        )
+
+            # Step 3.5: Apply BM25 keyword search as fallback (if enabled and still few results)
+            if (coordinator.is_bm25_available() and
+                self.config.ENABLE_BM25_FALLBACK and
+                len(all_results) < top_k):
+
+                logger.info(f"Applying BM25 fallback search (current results: {len(all_results)})")
+                bm25_results = coordinator.search_bm25(query, top_k)
+
+                for result in bm25_results:
+                    # Use chunk_id as key for BM25 results
+                    result_key = f"chunk_{result.chunk_id}"
+
+                    # Check if we already have this result (by text similarity)
+                    is_duplicate = False
+                    for existing in all_results.values():
+                        if existing.text == result.text:
+                            is_duplicate = True
+                            if 'bm25' not in existing.strategies_used:
+                                existing.strategies_used.append('bm25')
+                            break
+
+                    if not is_duplicate:
+                        # Use negative FAISS ID for BM25 results
+                        bm25_faiss_id = -(len(all_results) + 1)
+                        all_results[bm25_faiss_id] = result
+                        logger.info(f"Added BM25 result: {result.chunk_id}")
+
+            # Convert to list
+            results_list = list(all_results.values())
+
+            if not results_list:
+                logger.info("Enhanced search found no results")
+                return []
+
+            # Step 4: Calculate adaptive threshold
+            relevance_scores = [r.relevance_score for r in results_list]
+            threshold, adjustments = coordinator.calculate_adaptive_threshold(
+                query, relevance_scores, len(results_list)
+            )
+
+            logger.info(f"Adaptive threshold: {threshold:.3f} (base: {self.config.BASE_RELEVANCE_THRESHOLD})")
+            if adjustments:
+                logger.debug(f"Threshold adjustments: {adjustments}")
+
+            # Step 5: Filter results
+            filtered_results = [r for r in results_list if r.relevance_score >= threshold]
+
+            # If still too few results, relax threshold
+            if len(filtered_results) < min(top_k, 3):
+                relaxed_threshold = max(self.config.MIN_RELEVANCE_THRESHOLD, threshold * 0.5)
+                filtered_results = [r for r in results_list if r.relevance_score >= relaxed_threshold]
+                logger.info(f"Relaxed threshold to {relaxed_threshold:.3f}, got {len(filtered_results)} results")
+
+            # If still no results, return all sorted by relevance
+            if len(filtered_results) == 0:
+                filtered_results = sorted(results_list, key=lambda x: x.relevance_score, reverse=True)
+                logger.warning("No results passed threshold, returning all results sorted by relevance")
+
+            # Sort by relevance score
+            filtered_results.sort(key=lambda x: x.relevance_score, reverse=True)
+
+            # Step 6: Calculate quality metrics
+            quality_metrics = coordinator.calculate_quality_metrics(
+                filtered_results[:top_k], query
+            )
+
+            # Step 7: Format results for return
+            formatted_results = []
+            for i, result in enumerate(filtered_results[:top_k]):
+                result_dict = {
+                    "text": result.text,
+                    "similarity_score": float(result.similarity_score),
+                    "relevance_score": float(result.relevance_score),
+                    "faiss_id": int(result.faiss_id),
+                    "match_type": result.match_type,
+                    "strategies_used": result.strategies_used,
+                    "search_method": "enhanced"
+                }
+
+                # Add quality metrics to first result only
+                if i == 0:
+                    result_dict["quality_metrics"] = {
+                        "avg_relevance_score": quality_metrics.avg_relevance_score,
+                        "diversity_score": quality_metrics.diversity_score,
+                        "coverage_ratio": quality_metrics.coverage_ratio,
+                        "precision_at_k": quality_metrics.precision_at_k,
+                        "total_results": quality_metrics.total_results
+                    }
+
+                formatted_results.append(result_dict)
+
+            logger.info(f"Enhanced search complete: {len(formatted_results)} results (threshold: {threshold:.3f})")
+            return formatted_results
+
+        except Exception as e:
+            logger.error(f"Enhanced search failed: {e}, falling back to traditional search")
+            # Fallback to traditional search
+            return self._traditional_search(query, top_k)
+
+    def _execute_vector_search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+        """Execute vector search and return results with relevance scores"""
+        if self.index.ntotal == 0:
+            return []
+
+        # Check if IVF index is trained
+        if hasattr(self.index, 'is_trained') and not self.index.is_trained:
+            logger.warning("IVF index not trained, cannot search")
+            return []
+
+        # Generate query embedding
+        query_embedding = self.embedding_model.encode(
+            [query],
+            convert_to_numpy=True,
+            show_progress_bar=False,
+            normalize_embeddings=True
+        )
+
+        # Adjust search parameters for different index types
+        if hasattr(self.index, 'nprobe'):  # IVF index
+            optimal_nprobe = min(self.config.NPROBE, self.config.NLIST // 2, 20)
+            self.index.nprobe = max(optimal_nprobe, 5)
+        elif hasattr(self.index, 'hnsw'):  # HNSW index
+            self.index.hnsw.efSearch = max(self.config.EF_SEARCH, 100)
+
+        # Search with candidate multiplier
+        search_k = min(top_k * self.config.SEARCH_CANDIDATE_MULTIPLIER, self.index.ntotal)
+        distances, indices = self.index.search(query_embedding, search_k)
+
+        # Build results
+        results = []
+        for dist, idx in zip(distances[0], indices[0]):
+            if idx != -1 and str(idx) in self.id_to_chunk:
+                score = float(dist)
+                if not (score == float('inf') or score == float('-inf') or score != score):
+                    text = self.id_to_chunk[str(idx)]
+
+                    # Calculate relevance score (cosine similarity)
+                    # For normalized vectors, FAISS distance ≈ 1 - cosine_similarity
+                    relevance_score = max(0.0, 1.0 - score)
+
+                    results.append({
+                        "text": text,
+                        "score": score,
+                        "similarity_score": score,
+                        "relevance_score": relevance_score,
+                        "faiss_id": int(idx)
+                    })
+
+        return results
+
+    def _execute_exact_match_search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+        """Execute exact field matching search on metadata"""
+        results = []
+        query_lower = query.lower()
+
+        # Get all chunks
+        for faiss_id_str, text in self.id_to_chunk.items():
+            faiss_id = int(faiss_id_str)
+            text_lower = text.lower()
+
+            # Check for exact match in text
+            if query_lower in text_lower:
+                # Calculate score based on match quality
+                if query_lower == text_lower:
+                    score = 1.0
+                elif query_lower in text_lower:
+                    score = 0.8
+
+                results.append({
+                    "text": text,
+                    "score": score,
+                    "similarity_score": score,
+                    "relevance_score": score,
+                    "faiss_id": faiss_id
+                })
+
+        # Sort by score and return top_k
+        results.sort(key=lambda x: x['score'], reverse=True)
         return results[:top_k]
     
     def delete_texts(self, texts_to_delete: List[str]) -> int:

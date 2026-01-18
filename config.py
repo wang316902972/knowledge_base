@@ -74,6 +74,25 @@ class Config:
     RELEVANCE_THRESHOLD: float = float(os.getenv("RELEVANCE_THRESHOLD", "0.5"))
     DIVERSITY_WEIGHT: float = float(os.getenv("DIVERSITY_WEIGHT", "0.2"))
     SEARCH_CANDIDATE_MULTIPLIER: int = int(os.getenv("SEARCH_CANDIDATE_MULTIPLIER", "3"))  # 搜索候选数量倍数
+
+    # 检索增强配置 (Phase 1: Adaptive Thresholding)
+    BASE_RELEVANCE_THRESHOLD: float = float(os.getenv("BASE_RELEVANCE_THRESHOLD", "0.1"))
+    MIN_RELEVANCE_THRESHOLD: float = float(os.getenv("MIN_RELEVANCE_THRESHOLD", "0.05"))
+    MAX_RELEVANCE_THRESHOLD: float = float(os.getenv("MAX_RELEVANCE_THRESHOLD", "0.3"))
+    ENABLE_ADAPTIVE_THRESHOLD: bool = os.getenv("ENABLE_ADAPTIVE_THRESHOLD", "true").lower() == "true"
+
+    # 查询增强配置 (Phase 2: Query Expansion)
+    ENABLE_QUERY_EXPANSION: bool = os.getenv("ENABLE_QUERY_EXPANSION", "true").lower() == "true"
+    MAX_EXPANDED_QUERIES: int = int(os.getenv("MAX_EXPANDED_QUERIES", "5"))
+    DOMAIN_TERM_DICT_PATH: str = os.getenv("DOMAIN_TERM_DICT_PATH", "config/domain_terms.json")
+
+    # 混合检索配置 (Phase 3: Hybrid Retrieval)
+    ENABLE_HYBRID_RETRIEVAL: bool = os.getenv("ENABLE_HYBRID_RETRIEVAL", "true").lower() == "true"
+    VECTOR_SEARCH_WEIGHT: float = float(os.getenv("VECTOR_SEARCH_WEIGHT", "0.7"))
+    BM25_SEARCH_WEIGHT: float = float(os.getenv("BM25_SEARCH_WEIGHT", "0.2"))
+    EXACT_MATCH_WEIGHT: float = float(os.getenv("EXACT_MATCH_WEIGHT", "0.1"))
+    ENABLE_BM25_FALLBACK: bool = os.getenv("ENABLE_BM25_FALLBACK", "true").lower() == "true"
+    ENABLE_EXACT_MATCH_FALLBACK: bool = os.getenv("ENABLE_EXACT_MATCH_FALLBACK", "true").lower() == "true"
     
     # 性能配置
     AUTO_SAVE: bool = os.getenv("AUTO_SAVE", "false").lower() == "true"

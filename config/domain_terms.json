@@ -1,0 +1,19 @@
+{
+  "反作弊": ["anti-cheat", "反外挂", "防作弊", "安全检测", "安全防护"],
+  "归因": ["attribution", "溯源", "分析", "追踪", "追踪分析"],
+  "预制件": ["prefab", "组件", "模块", "plugin", "component"],
+  "AI辅助": ["ai辅助", "ai-assisted", "智能辅助", "ai aided"],
+  "诊断": ["diagnosis", "分析", "检测", "识别", "分析诊断"],
+  "多维查询": ["multi-dimensional query", "多维检索", "复合查询", "组合查询"],
+  "关联反查": ["association lookup", "关联查询", "横向关联", "关联分析"],
+  "异常检测": ["anomaly detection", "异常识别", "反常检测", "异常分析"],
+  "风险提示": ["risk alert", "风险预警", "风险提醒", "风险警告"],
+  "数据报表": ["data report", "数据报告", "统计报表", "分析报告"],
+  "网络图谱": ["network graph", "关系图", "关联图", "网络图"],
+  "溯源": ["traceability", "追踪", "回溯", "源头追踪"],
+  "代币": ["token", "虚拟货币", "游戏币", "currency"],
+  "流水": ["transaction record", "交易记录", "账单", "记录"],
+  "机器码": ["machine code", "device id", "设备码", "硬件标识"],
+  "账号": ["account", "账户", "user account", "用户账户"],
+  "服务器": ["server", "主机", "host", "游戏服务器"]
+}
