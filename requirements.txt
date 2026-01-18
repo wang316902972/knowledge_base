@@ -4,6 +4,7 @@ uvicorn[standard]>=0.24.0
 pydantic>=2.0.0
 numpy>=1.24.0
 sentence-transformers>=2.2.0
+rank-bm25>=0.2.2
 
 # MCP (Model Context Protocol) support
 mcp>=0.9.0

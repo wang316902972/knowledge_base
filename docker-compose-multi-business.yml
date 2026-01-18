@@ -9,18 +9,25 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - .:/app
+      # Mount model cache from host to container (使用绝对路径)
+      - /home/nd/.cache/huggingface:/root/.cache/huggingface:rw
     environment:
       - ENVIRONMENT=production
-      - BUSINESS_ID=default
+      - BUINESSTYPE=default
       - SERVICE_NAME=faiss-vector-db-default
+      - MAX_DB_INSTANCES=10
       - API_HOST=0.0.0.0
       - API_PORT=8001
+      # Hugging Face mirror for China
+      - HF_ENDPOINT=https://hf-mirror.com
     restart: unless-stopped
     networks:
       - faiss-network
+    # Use host network for better internet access (optional)
+    # network_mode: host
 
-  # 文档检索业务实例
-  # faiss-document:
+  # SD业务实例示例
+  # faiss-sd:
   #   build: .
   #   ports:
   #     - "8004:8001"
@@ -30,17 +37,38 @@ services:
   #     - .:/app
   #   environment:
   #     - ENVIRONMENT=production
-  #     - BUSINESS_ID=document
-  #     - SERVICE_NAME=faiss-vector-db-document
+  #     - BUINESSTYPE=sd
+  #     - SERVICE_NAME=faiss-vector-db-sd
+  #     - MAX_DB_INSTANCES=15
+  #     - API_HOST=0.0.0.0
+  #     - API_PORT=8001
   #     - FAISS_INDEX_TYPE=HNSW
   #     - AUTO_SAVE=true
   #     - LOG_LEVEL=INFO
   #     - BATCH_SIZE=64
+  #   restart: unless-stopped
+  #   networks:
+  #     - faiss-network
+
+  # Warning业务实例示例
+  # faiss-warning:
+  #   build: .
+  #   ports:
+  #     - "8005:8001"
+  #   volumes:
+  #     - ./data:/app/data
+  #     - ./logs:/app/logs
+  #     - .:/app
+  #   environment:
+  #     - ENVIRONMENT=production
+  #     - BUINESSTYPE=warning
+  #     - SERVICE_NAME=faiss-vector-db-warning
+  #     - MAX_DB_INSTANCES=12
   #     - API_HOST=0.0.0.0
   #     - API_PORT=8001
-  #     - FAISS_NLIST=200
-  #     - MAX_CHUNK_SIZE=1000
-  #     - DEFAULT_CHUNK_SIZE=300
+  #     - FAISS_INDEX_TYPE=HNSW
+  #     - AUTO_SAVE=true
+  #     - LOG_LEVEL=INFO
   #   restart: unless-stopped
   #   networks:
   #     - faiss-network

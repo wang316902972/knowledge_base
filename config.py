@@ -8,24 +8,39 @@ class Config:
     """向量数据库配置类"""
 
     # 业务标识配置
-    BUSINESS_ID: str = os.getenv("BUSINESS_ID", "default")  # 业务标识符
+    DEFAULT_BUSINESSTYPE: str = os.getenv("BUINESSTYPE", "default")  # 业务类型标识符
     SERVICE_NAME: str = os.getenv("SERVICE_NAME", "faiss-vector-db")  # 服务名称
 
-    # 文件路径配置 - 支持基于业务ID的动态路径
+    # 文件路径配置 - 支持基于业务类型的动态路径
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
     DATA_DIR: str = os.getenv("FAISS_DATA_DIR", os.path.join(SCRIPT_DIR, "data"))  # 数据目录
 
-    @property
-    def INDEX_FILE(self) -> str:
+    def get_index_file(self, businesstype: str = None) -> str:
         """动态生成索引文件路径"""
-        filename = f"{self.BUSINESS_ID}_knowledge_base.index"
-        return os.getenv("FAISS_INDEX_FILE", os.path.join(self.DATA_DIR, filename))
+        if businesstype is None:
+            businesstype = self.DEFAULT_BUSINESSTYPE
+        businesstype = self._validate_businesstype(businesstype)
+        filename = f"{businesstype}_knowledge_base.index"
+        businesstype_dir = os.path.join(self.DATA_DIR, businesstype)
+        return os.getenv("FAISS_INDEX_FILE", os.path.join(businesstype_dir, filename))
 
-    @property
-    def METADATA_FILE(self) -> str:
+    def get_metadata_file(self, businesstype: str = None) -> str:
         """动态生成元数据文件路径"""
-        filename = f"{self.BUSINESS_ID}_knowledge_base.json"
-        return os.getenv("FAISS_METADATA_FILE", os.path.join(self.DATA_DIR, filename))
+        if businesstype is None:
+            businesstype = self.DEFAULT_BUSINESSTYPE
+        businesstype = self._validate_businesstype(businesstype)
+        filename = f"{businesstype}_knowledge_base.json"
+        businesstype_dir = os.path.join(self.DATA_DIR, businesstype)
+        return os.getenv("FAISS_METADATA_FILE", os.path.join(businesstype_dir, filename))
+
+    @staticmethod
+    def _validate_businesstype(businesstype: str) -> str:
+        """验证和清理业务类型名称"""
+        import re
+        # 只允许字母、数字、下划线和连字符；最长50个字符
+        if not re.match(r'^[a-zA-Z0-9_-]{1,50}$', businesstype):
+            raise ValueError(f"Invalid businesstype: '{businesstype}'. Must be 1-50 alphanumeric characters, underscores, or hyphens only")
+        return businesstype.lower()
     
     # 模型配置
     MODEL_NAME: str = os.getenv("EMBEDDING_MODEL", "paraphrase-multilingual-MiniLM-L12-v2")
@@ -59,6 +74,25 @@ class Config:
     RELEVANCE_THRESHOLD: float = float(os.getenv("RELEVANCE_THRESHOLD", "0.5"))
     DIVERSITY_WEIGHT: float = float(os.getenv("DIVERSITY_WEIGHT", "0.2"))
     SEARCH_CANDIDATE_MULTIPLIER: int = int(os.getenv("SEARCH_CANDIDATE_MULTIPLIER", "3"))  # 搜索候选数量倍数
+
+    # 检索增强配置 (Phase 1: Adaptive Thresholding)
+    BASE_RELEVANCE_THRESHOLD: float = float(os.getenv("BASE_RELEVANCE_THRESHOLD", "0.1"))
+    MIN_RELEVANCE_THRESHOLD: float = float(os.getenv("MIN_RELEVANCE_THRESHOLD", "0.05"))
+    MAX_RELEVANCE_THRESHOLD: float = float(os.getenv("MAX_RELEVANCE_THRESHOLD", "0.3"))
+    ENABLE_ADAPTIVE_THRESHOLD: bool = os.getenv("ENABLE_ADAPTIVE_THRESHOLD", "true").lower() == "true"
+
+    # 查询增强配置 (Phase 2: Query Expansion)
+    ENABLE_QUERY_EXPANSION: bool = os.getenv("ENABLE_QUERY_EXPANSION", "true").lower() == "true"
+    MAX_EXPANDED_QUERIES: int = int(os.getenv("MAX_EXPANDED_QUERIES", "5"))
+    DOMAIN_TERM_DICT_PATH: str = os.getenv("DOMAIN_TERM_DICT_PATH", "config/domain_terms.json")
+
+    # 混合检索配置 (Phase 3: Hybrid Retrieval)
+    ENABLE_HYBRID_RETRIEVAL: bool = os.getenv("ENABLE_HYBRID_RETRIEVAL", "true").lower() == "true"
+    VECTOR_SEARCH_WEIGHT: float = float(os.getenv("VECTOR_SEARCH_WEIGHT", "0.7"))
+    BM25_SEARCH_WEIGHT: float = float(os.getenv("BM25_SEARCH_WEIGHT", "0.2"))
+    EXACT_MATCH_WEIGHT: float = float(os.getenv("EXACT_MATCH_WEIGHT", "0.1"))
+    ENABLE_BM25_FALLBACK: bool = os.getenv("ENABLE_BM25_FALLBACK", "true").lower() == "true"
+    ENABLE_EXACT_MATCH_FALLBACK: bool = os.getenv("ENABLE_EXACT_MATCH_FALLBACK", "true").lower() == "true"
     
     # 性能配置
     AUTO_SAVE: bool = os.getenv("AUTO_SAVE", "false").lower() == "true"
@@ -86,13 +120,13 @@ class Config:
     def validate(cls):
         """验证配置参数"""
         errors = []
-        
+
         if cls.MIN_CHUNK_SIZE >= cls.MAX_CHUNK_SIZE:
             errors.append("MIN_CHUNK_SIZE must be less than MAX_CHUNK_SIZE")
-        
+
         if cls.DEFAULT_CHUNK_OVERLAP >= cls.DEFAULT_CHUNK_SIZE:
             errors.append("DEFAULT_CHUNK_OVERLAP must be less than DEFAULT_CHUNK_SIZE")
-        
+
         if cls.INDEX_TYPE not in ["FlatIP", "FlatL2", "IVFFlat", "HNSW"]:
             errors.append(f"Unsupported INDEX_TYPE: {cls.INDEX_TYPE}")
 
@@ -104,10 +138,16 @@ class Config:
 
         if cls.BATCH_SIZE <= 0:
             errors.append("BATCH_SIZE must be positive")
-        
+
+        # 验证默认业务类型
+        try:
+            cls._validate_businesstype(cls.DEFAULT_BUSINESSTYPE)
+        except ValueError as e:
+            errors.append(str(e))
+
         if errors:
             raise ValueError("Configuration validation failed:\n" + "\n".join(errors))
-        
+
         return True
 
 # 生产环境配置示例

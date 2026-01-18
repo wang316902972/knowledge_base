@@ -6,6 +6,7 @@ import threading
 import uuid
 import asyncio
 import os
+import time
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Sequence, Union
 from contextlib import asynccontextmanager
@@ -15,6 +16,12 @@ from pydantic import BaseModel, Field, field_validator
 from sentence_transformers import SentenceTransformer
 from config import get_config, Config
 from search_optimization import AdvancedSearchIndex, QualityMetrics
+from retrieval_enhancement import (
+    RetrievalEnhancementCoordinator,
+    EnhancedQuery,
+    SearchResult,
+    QualityMetrics as EnhancedQualityMetrics
+)
 
 # 配置日志
 logging.basicConfig(
@@ -23,11 +30,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# 设置 Hugging Face 镜像（中国网络优化）
+# 优先使用环境变量 HF_ENDPOINT，否则使用默认镜像
+if not os.environ.get('HF_ENDPOINT'):
+    os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+    logger.info(f"设置 Hugging Face 镜像: {os.environ['HF_ENDPOINT']}")
+
+# 强制设置 HuggingFace Hub 缓存路径（sentence_transformers 依赖此路径）
+os.environ['HF_HOME'] = '/root/.cache/huggingface'
+os.environ['HUGGINGFACE_HUB_CACHE'] = '/root/.cache/huggingface/hub'
+logger.info(f"设置 HuggingFace 缓存路径: {os.environ['HF_HOME']}")
+
 
 # 线程安全的向量数据库类
 class FaissVectorDB:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, businesstype: str = None):
         self.config = config
+        self.businesstype = businesstype or config.DEFAULT_BUSINESSTYPE
+        self.businesstype = config._validate_businesstype(self.businesstype)
         self.lock = threading.RLock()  # 重入锁保证线程安全
         self.embedding_model = None
         self.index = None
@@ -35,32 +55,46 @@ class FaissVectorDB:
         self.chunk_to_id: Dict[str, str] = {}  # 反向索引用于精确删除
         self.dirty = False  # 标记是否有未保存的更改
 
+        # 业务类型特定的路径
+        self.index_file = config.get_index_file(self.businesstype)
+        self.metadata_file = config.get_metadata_file(self.businesstype)
+        self.data_dir = os.path.join(config.DATA_DIR, self.businesstype)
+
         self._initialize()
     
     def _initialize(self):
         """初始化模型和索引"""
         try:
             logger.info(f"环境: {self.config.ENVIRONMENT}")
-            logger.info(f"业务ID: {self.config.BUSINESS_ID}")
-            logger.info(f"数据目录: {self.config.DATA_DIR}")
-            logger.info(f"索引文件: {self.config.INDEX_FILE}")
-            logger.info(f"元数据文件: {self.config.METADATA_FILE}")
+            logger.info(f"业务类型: {self.businesstype}")
+            logger.info(f"数据目录: {self.data_dir}")
+            logger.info(f"索引文件: {self.index_file}")
+            logger.info(f"元数据文件: {self.metadata_file}")
             logger.info(f"是否使用GPU: {self.config.USE_GPU}")
             logger.info(f"模型名称: {self.config.MODEL_NAME}")
 
             # 确保数据目录存在
-            os.makedirs(self.config.DATA_DIR, exist_ok=True)
+            os.makedirs(self.data_dir, exist_ok=True)
 
             # 优先尝试使用本地缓存的模型
+            # 构造模型本地路径
+            model_cache_path = '/root/.cache/huggingface/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots'
+
             try:
-                logger.info("尝试加载本地缓存的模型...")
-                self.embedding_model = SentenceTransformer(
-                    self.config.MODEL_NAME,
-                    local_files_only=True
-                )
-                logger.info("成功加载本地缓存的模型")
+                # 查找实际的快照目录
+                if os.path.exists(model_cache_path):
+                    snapshots = [d for d in os.listdir(model_cache_path) if os.path.isdir(os.path.join(model_cache_path, d))]
+                    if snapshots:
+                        actual_model_path = os.path.join(model_cache_path, snapshots[0])
+                        logger.info(f"找到本地模型路径: {actual_model_path}")
+                        self.embedding_model = SentenceTransformer(actual_model_path)
+                        logger.info("成功加载本地缓存的模型")
+                    else:
+                        raise Exception("未找到模型快照目录")
+                else:
+                    raise Exception(f"模型缓存路径不存在: {model_cache_path}")
             except Exception as e:
-                logger.warning(f"本地模型加载失败，尝试从网络下载: {e}")
+                logger.warning(f"本地模型加载失败 ({e})，尝试从网络下载...")
                 # 读取 Hugging Face token（如果存在）
                 token = None
                 token_path = os.path.expanduser("~/.huggingface/token")
@@ -82,7 +116,7 @@ class FaissVectorDB:
                 self.config.EMBEDDING_DIM = actual_dim
 
             self._create_or_load_index()
-            logger.info(f"业务 {self.config.BUSINESS_ID} 向量数据库初始化完成")
+            logger.info(f"业务类型 {self.businesstype} 向量数据库初始化完成")
 
         except Exception as e:
             logger.error(f"初始化失败: {e}")
@@ -246,8 +280,20 @@ class FaissVectorDB:
                 logger.error(f"添加文本失败: {e}")
                 raise HTTPException(status_code=500, detail=f"添加文本失败: {str(e)}")
     
-    def search(self, query: str, top_k: int = 5, use_optimization: bool = True) -> List[Dict[str, Any]]:
-        """搜索相似文本 - 支持优化模式"""
+    def search(self, query: str, top_k: int = 5, use_optimization: bool = True,
+             use_enhanced: bool = True) -> List[Dict[str, Any]]:
+        """
+        搜索相似文本 - 支持优化模式和增强检索
+
+        Args:
+            query: Search query text
+            top_k: Number of results to return
+            use_optimization: Use advanced search optimization
+            use_enhanced: Use new enhanced retrieval with adaptive thresholding
+
+        Returns:
+            List of search results
+        """
         with self.lock:
             try:
                 if self.index.ntotal == 0:
@@ -257,6 +303,10 @@ class FaissVectorDB:
                 if hasattr(self.index, 'is_trained') and not self.index.is_trained:
                     logger.warning("IVF索引尚未训练，无法进行搜索")
                     return []
+
+                # 优先使用增强检索（如果启用）
+                if use_enhanced and self.config.ENABLE_ADAPTIVE_THRESHOLD:
+                    return self.enhanced_search(query, top_k)
 
                 # 使用优化的搜索方法
                 if use_optimization and hasattr(self, 'advanced_search_index'):
@@ -323,6 +373,268 @@ class FaissVectorDB:
 
         logger.info(f"传统搜索完成，返回 {len(results)} 个结果")
         return results[:top_k]
+
+    def enhanced_search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """
+        Enhanced search with adaptive thresholding, query expansion, and hybrid retrieval
+
+        Args:
+            query: Search query text
+            top_k: Number of results to return
+
+        Returns:
+            List of search results with enhanced metadata
+        """
+        try:
+            # Initialize enhancement coordinator if not already initialized
+            if not hasattr(self, 'enhancement_coordinator'):
+                self.enhancement_coordinator = RetrievalEnhancementCoordinator(
+                    self.config, self.embedding_model, self.businesstype
+                )
+
+            coordinator = self.enhancement_coordinator
+
+            # Step 1: Enhance query
+            enhanced_query = coordinator.enhance_query(query)
+            logger.info(f"Query enhanced: {len(enhanced_query.expanded_variants)} variants, "
+                       f"domain terms: {enhanced_query.domain_terms}")
+
+            # Step 2: Execute vector search with expanded queries
+            all_results = {}  # faiss_id -> SearchResult
+
+            # Search with original query
+            vector_results = self._execute_vector_search(query, top_k * 3)
+            for result_dict in vector_results:
+                faiss_id = result_dict['faiss_id']
+                all_results[faiss_id] = SearchResult(
+                    text=result_dict['text'],
+                    similarity_score=result_dict.get('similarity_score', result_dict.get('score', 0.0)),
+                    relevance_score=result_dict.get('relevance_score', result_dict.get('score', 0.0)),
+                    faiss_id=faiss_id,
+                    match_type='vector',
+                    strategies_used=['vector']
+                )
+
+            # Search with expanded queries (if enabled and domain terms detected)
+            if (self.config.ENABLE_QUERY_EXPANSION and
+                enhanced_query.expanded_variants and
+                enhanced_query.metadata.get('has_domain_terms', False)):
+
+                for expanded_query in enhanced_query.expanded_variants[:3]:  # Use top 3
+                    expanded_results = self._execute_vector_search(expanded_query, top_k)
+                    for result_dict in expanded_results:
+                        faiss_id = result_dict['faiss_id']
+                        if faiss_id in all_results:
+                            # Update strategies_used
+                            if 'vector_expanded' not in all_results[faiss_id].strategies_used:
+                                all_results[faiss_id].strategies_used.append('vector_expanded')
+                        else:
+                            all_results[faiss_id] = SearchResult(
+                                text=result_dict['text'],
+                                similarity_score=result_dict.get('similarity_score', result_dict.get('score', 0.0)),
+                                relevance_score=result_dict.get('relevance_score', result_dict.get('score', 0.0)),
+                                faiss_id=faiss_id,
+                                match_type='vector',
+                                strategies_used=['vector_expanded']
+                            )
+
+            # Step 3: Apply exact field matching as fallback (if enabled)
+            if self.config.ENABLE_EXACT_MATCH_FALLBACK and len(all_results) < top_k:
+                exact_results = self._execute_exact_match_search(query, top_k)
+                for result_dict in exact_results:
+                    faiss_id = result_dict['faiss_id']
+                    if faiss_id in all_results:
+                        if 'exact' not in all_results[faiss_id].strategies_used:
+                            all_results[faiss_id].strategies_used.append('exact')
+                    else:
+                        all_results[faiss_id] = SearchResult(
+                            text=result_dict['text'],
+                            similarity_score=result_dict['score'],
+                            relevance_score=result_dict['score'],
+                            faiss_id=faiss_id,
+                            match_type='exact',
+                            strategies_used=['exact']
+                        )
+
+            # Step 3.5: Apply BM25 keyword search as fallback (if enabled and still few results)
+            if (coordinator.is_bm25_available() and
+                self.config.ENABLE_BM25_FALLBACK and
+                len(all_results) < top_k):
+
+                logger.info(f"Applying BM25 fallback search (current results: {len(all_results)})")
+                bm25_results = coordinator.search_bm25(query, top_k)
+
+                for result in bm25_results:
+                    # Use chunk_id as key for BM25 results
+                    result_key = f"chunk_{result.chunk_id}"
+
+                    # Check if we already have this result (by text similarity)
+                    is_duplicate = False
+                    for existing in all_results.values():
+                        if existing.text == result.text:
+                            is_duplicate = True
+                            if 'bm25' not in existing.strategies_used:
+                                existing.strategies_used.append('bm25')
+                            break
+
+                    if not is_duplicate:
+                        # Use negative FAISS ID for BM25 results
+                        bm25_faiss_id = -(len(all_results) + 1)
+                        all_results[bm25_faiss_id] = result
+                        logger.info(f"Added BM25 result: {result.chunk_id}")
+
+            # Convert to list
+            results_list = list(all_results.values())
+
+            if not results_list:
+                logger.info("Enhanced search found no results")
+                return []
+
+            # Step 4: Calculate adaptive threshold
+            relevance_scores = [r.relevance_score for r in results_list]
+            threshold, adjustments = coordinator.calculate_adaptive_threshold(
+                query, relevance_scores, len(results_list)
+            )
+
+            logger.info(f"Adaptive threshold: {threshold:.3f} (base: {self.config.BASE_RELEVANCE_THRESHOLD})")
+            if adjustments:
+                logger.debug(f"Threshold adjustments: {adjustments}")
+
+            # Step 5: Filter results
+            filtered_results = [r for r in results_list if r.relevance_score >= threshold]
+
+            # If still too few results, relax threshold
+            if len(filtered_results) < min(top_k, 3):
+                relaxed_threshold = max(self.config.MIN_RELEVANCE_THRESHOLD, threshold * 0.5)
+                filtered_results = [r for r in results_list if r.relevance_score >= relaxed_threshold]
+                logger.info(f"Relaxed threshold to {relaxed_threshold:.3f}, got {len(filtered_results)} results")
+
+            # If still no results, return all sorted by relevance
+            if len(filtered_results) == 0:
+                filtered_results = sorted(results_list, key=lambda x: x.relevance_score, reverse=True)
+                logger.warning("No results passed threshold, returning all results sorted by relevance")
+
+            # Sort by relevance score
+            filtered_results.sort(key=lambda x: x.relevance_score, reverse=True)
+
+            # Step 6: Calculate quality metrics
+            quality_metrics = coordinator.calculate_quality_metrics(
+                filtered_results[:top_k], query
+            )
+
+            # Step 7: Format results for return
+            formatted_results = []
+            for i, result in enumerate(filtered_results[:top_k]):
+                result_dict = {
+                    "text": result.text,
+                    "similarity_score": float(result.similarity_score),
+                    "relevance_score": float(result.relevance_score),
+                    "faiss_id": int(result.faiss_id),
+                    "match_type": result.match_type,
+                    "strategies_used": result.strategies_used,
+                    "search_method": "enhanced"
+                }
+
+                # Add quality metrics to first result only
+                if i == 0:
+                    result_dict["quality_metrics"] = {
+                        "avg_relevance_score": quality_metrics.avg_relevance_score,
+                        "diversity_score": quality_metrics.diversity_score,
+                        "coverage_ratio": quality_metrics.coverage_ratio,
+                        "precision_at_k": quality_metrics.precision_at_k,
+                        "total_results": quality_metrics.total_results
+                    }
+
+                formatted_results.append(result_dict)
+
+            logger.info(f"Enhanced search complete: {len(formatted_results)} results (threshold: {threshold:.3f})")
+            return formatted_results
+
+        except Exception as e:
+            logger.error(f"Enhanced search failed: {e}, falling back to traditional search")
+            # Fallback to traditional search
+            return self._traditional_search(query, top_k)
+
+    def _execute_vector_search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+        """Execute vector search and return results with relevance scores"""
+        if self.index.ntotal == 0:
+            return []
+
+        # Check if IVF index is trained
+        if hasattr(self.index, 'is_trained') and not self.index.is_trained:
+            logger.warning("IVF index not trained, cannot search")
+            return []
+
+        # Generate query embedding
+        query_embedding = self.embedding_model.encode(
+            [query],
+            convert_to_numpy=True,
+            show_progress_bar=False,
+            normalize_embeddings=True
+        )
+
+        # Adjust search parameters for different index types
+        if hasattr(self.index, 'nprobe'):  # IVF index
+            optimal_nprobe = min(self.config.NPROBE, self.config.NLIST // 2, 20)
+            self.index.nprobe = max(optimal_nprobe, 5)
+        elif hasattr(self.index, 'hnsw'):  # HNSW index
+            self.index.hnsw.efSearch = max(self.config.EF_SEARCH, 100)
+
+        # Search with candidate multiplier
+        search_k = min(top_k * self.config.SEARCH_CANDIDATE_MULTIPLIER, self.index.ntotal)
+        distances, indices = self.index.search(query_embedding, search_k)
+
+        # Build results
+        results = []
+        for dist, idx in zip(distances[0], indices[0]):
+            if idx != -1 and str(idx) in self.id_to_chunk:
+                score = float(dist)
+                if not (score == float('inf') or score == float('-inf') or score != score):
+                    text = self.id_to_chunk[str(idx)]
+
+                    # Calculate relevance score (cosine similarity)
+                    # For normalized vectors, FAISS distance ≈ 1 - cosine_similarity
+                    relevance_score = max(0.0, 1.0 - score)
+
+                    results.append({
+                        "text": text,
+                        "score": score,
+                        "similarity_score": score,
+                        "relevance_score": relevance_score,
+                        "faiss_id": int(idx)
+                    })
+
+        return results
+
+    def _execute_exact_match_search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+        """Execute exact field matching search on metadata"""
+        results = []
+        query_lower = query.lower()
+
+        # Get all chunks
+        for faiss_id_str, text in self.id_to_chunk.items():
+            faiss_id = int(faiss_id_str)
+            text_lower = text.lower()
+
+            # Check for exact match in text
+            if query_lower in text_lower:
+                # Calculate score based on match quality
+                if query_lower == text_lower:
+                    score = 1.0
+                elif query_lower in text_lower:
+                    score = 0.8
+
+                results.append({
+                    "text": text,
+                    "score": score,
+                    "similarity_score": score,
+                    "relevance_score": score,
+                    "faiss_id": faiss_id
+                })
+
+        # Sort by score and return top_k
+        results.sort(key=lambda x: x['score'], reverse=True)
+        return results[:top_k]
     
     def delete_texts(self, texts_to_delete: List[str]) -> int:
         """精确删除指定文本"""
@@ -365,14 +677,14 @@ class FaissVectorDB:
                 if not self.dirty:
                     logger.info("没有更改，跳过保存")
                     return
-                
+
                 # 原子性保存：先保存到临时文件
-                temp_index_file = f"{self.config.INDEX_FILE}.tmp"
-                temp_metadata_file = f"{self.config.METADATA_FILE}.tmp"
-                
+                temp_index_file = f"{self.index_file}.tmp"
+                temp_metadata_file = f"{self.metadata_file}.tmp"
+
                 # 保存FAISS索引
                 faiss.write_index(self.index, temp_index_file)
-                
+
                 # 保存元数据为JSON（替代pickle）
                 metadata = {
                     "id_to_chunk": self.id_to_chunk,
@@ -380,17 +692,17 @@ class FaissVectorDB:
                     "embedding_dim": self.config.EMBEDDING_DIM,
                     "total_vectors": self.index.ntotal
                 }
-                
+
                 with open(temp_metadata_file, 'w', encoding='utf-8') as f:
                     json.dump(metadata, f, ensure_ascii=False, indent=2)
-                
+
                 # 原子性重命名
-                Path(temp_index_file).rename(self.config.INDEX_FILE)
-                Path(temp_metadata_file).rename(self.config.METADATA_FILE)
-                
+                Path(temp_index_file).rename(self.index_file)
+                Path(temp_metadata_file).rename(self.metadata_file)
+
                 self.dirty = False
                 logger.info("索引和元数据保存成功")
-                
+
             except Exception as e:
                 logger.error(f"保存失败: {e}")
                 # 清理临时文件
@@ -405,17 +717,17 @@ class FaissVectorDB:
         """加载索引和元数据"""
         try:
             # 加载FAISS索引
-            self.index = faiss.read_index(self.config.INDEX_FILE)
-            
+            self.index = faiss.read_index(self.index_file)
+
             # 加载元数据（JSON格式）
-            with open(self.config.METADATA_FILE, 'r', encoding='utf-8') as f:
+            with open(self.metadata_file, 'r', encoding='utf-8') as f:
                 metadata = json.load(f)
-            
+
             self.id_to_chunk = metadata.get("id_to_chunk", {})
             self.chunk_to_id = metadata.get("chunk_to_id", {})
-            
+
             logger.info(f"成功加载索引，包含 {self.index.ntotal} 个向量")
-            
+
         except FileNotFoundError as e:
             logger.warning(f"索引文件不存在: {e}")
             raise
@@ -571,25 +883,106 @@ class FaissVectorDB:
         except Exception as e:
             return {"error": f"基准测试失败: {str(e)}"}
 
+
+class VectorDBManager:
+    """多实例数据库管理器，支持缓存和生命周期管理"""
+
+    def __init__(self, config: Config, max_instances: int = 10):
+        self.config = config
+        self.max_instances = max_instances
+        self.instances: Dict[str, FaissVectorDB] = {}
+        self.access_times: Dict[str, float] = {}
+        self.lock = threading.RLock()
+        logger.info(f"VectorDBManager 初始化完成，max_instances={max_instances}")
+
+    def get_instance(self, businesstype: str = None) -> FaissVectorDB:
+        """获取或创建指定业务类型的数据库实例"""
+        businesstype = businesstype or self.config.DEFAULT_BUSINESSTYPE
+        businesstype = self.config._validate_businesstype(businesstype)
+
+        with self.lock:
+            # 更新访问时间
+            self.access_times[businesstype] = time.time()
+
+            # 如果实例已存在，直接返回
+            if businesstype in self.instances:
+                logger.debug(f"使用缓存的实例: '{businesstype}'")
+                return self.instances[businesstype]
+
+            # 检查是否达到容量上限
+            if len(self.instances) >= self.max_instances:
+                self._evict_lru()
+
+            # 创建新实例
+            logger.info(f"为业务类型 '{businesstype}' 创建新数据库实例")
+            instance = FaissVectorDB(self.config, businesstype)
+            self.instances[businesstype] = instance
+            return instance
+
+    def _evict_lru(self):
+        """淘汰最久未使用的实例"""
+        if not self.access_times:
+            return
+
+        lru_businesstype = min(self.access_times.items(), key=lambda x: x[1])[0]
+        logger.info(f"淘汰 LRU 实例: '{lru_businesstype}'")
+
+        # 保存被淘汰的实例
+        instance = self.instances.pop(lru_businesstype, None)
+        if instance and instance.dirty:
+            logger.info(f"淘汰前保存未保存的实例: {lru_businesstype}")
+            try:
+                instance.save()
+            except Exception as e:
+                logger.error(f"淘汰过程中保存失败: {e}")
+
+        self.access_times.pop(lru_businesstype, None)
+
+    def save_all(self):
+        """保存所有实例"""
+        with self.lock:
+            for businesstype, instance in self.instances.items():
+                if instance.dirty:
+                    logger.info(f"保存实例: '{businesstype}'")
+                    try:
+                        instance.save()
+                    except Exception as e:
+                        logger.error(f"保存实例 '{businesstype}' 失败: {e}")
+
+    def get_stats(self) -> Dict[str, Any]:
+        """获取管理器统计信息"""
+        with self.lock:
+            return {
+                "total_instances": len(self.instances),
+                "max_instances": self.max_instances,
+                "active_business_types": list(self.instances.keys()),
+                "instances_with_unsaved_changes": sum(
+                    1 for inst in self.instances.values() if inst.dirty
+                )
+            }
+
+
 # 全局向量数据库实例
 config = get_config()
-vector_db = None
+vector_db_manager = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    global vector_db
+    global vector_db_manager
     try:
-        # 启动时初始化
-        logger.info("正在初始化向量数据库...")
-        vector_db = FaissVectorDB(config)
+        # 启动时初始化管理器
+        logger.info("正在初始化向量数据库管理器...")
+        max_instances = int(os.getenv("MAX_DB_INSTANCES", "10"))
+        vector_db_manager = VectorDBManager(config, max_instances)
+        logger.info(f"向量数据库管理器初始化完成 (max_instances={max_instances})")
         yield
     finally:
-        # 关闭时保存
-        if vector_db and vector_db.dirty:
-            logger.info("正在保存未保存的更改...")
-            vector_db.save()
-        logger.info("向量数据库已关闭")
+        # 关闭时保存所有实例
+        if vector_db_manager:
+            logger.info("正在保存所有数据库实例...")
+            vector_db_manager.save_all()
+            logger.info("所有数据库实例已关闭")
 
 # 创建FastAPI应用
 app = FastAPI(
@@ -611,6 +1004,7 @@ app.add_middleware(
 # 请求模型
 class Document(BaseModel):
     content: str = Field(..., description="文档内容", max_length=50000)
+    businesstype: Optional[str] = Field(None, description="业务类型标识符", pattern="^[a-zA-Z0-9_-]{1,50}$")
     chunk_size: int = Field(default=500, description="分块大小", ge=50, le=2000)
     chunk_overlap: int = Field(default=50, description="分块重叠", ge=0, le=500)
 
@@ -623,6 +1017,7 @@ class Document(BaseModel):
 
 class Query(BaseModel):
     question: str = Field(..., description="查询问题", max_length=1000)
+    businesstype: Optional[str] = Field(None, description="业务类型标识符", pattern="^[a-zA-Z0-9_-]{1,50}$")
     top_k: int = Field(default=3, description="返回结果数量", ge=1, le=50)
     use_optimization: bool = Field(default=True, description="是否使用搜索优化")
 
@@ -631,6 +1026,7 @@ class BenchmarkQueries(BaseModel):
 
 class BatchTexts(BaseModel):
     texts: List[str] = Field(..., description="批量文本列表", max_length=100)
+    businesstype: Optional[str] = Field(None, description="业务类型标识符", pattern="^[a-zA-Z0-9_-]{1,50}$")
 
 
 # ============================================================================
@@ -674,11 +1070,15 @@ def get_mcp_tools() -> List[MCPTool]:
     """获取所有 MCP 工具定义"""
     return [
         MCPTool(
-            name="search_knowledge",
-            description="在向量数据库中搜索相关知识。支持语义搜索和优化搜索模式。",
+            name="search",
+            description="在向量数据库中搜索相关知识。支持语义搜索。",
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "businesstype": {
+                        "type": "string",
+                        "description": "业务类型标识符（可选，默认使用环境变量配置）"
+                    },
                     "query": {
                         "type": "string",
                         "description": "搜索查询文本，支持自然语言问题"
@@ -689,22 +1089,21 @@ def get_mcp_tools() -> List[MCPTool]:
                         "default": 5,
                         "minimum": 1,
                         "maximum": 50
-                    },
-                    "use_optimization": {
-                        "type": "boolean",
-                        "description": "是否使用优化搜索（包括多样性重排序、相关性过滤等）",
-                        "default": True
                     }
                 },
                 "required": ["query"]
             }
         ),
         MCPTool(
-            name="add_document",
+            name="add",
             description="将文档添加到向量数据库。文档会自动分块并生成向量索引。",
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "businesstype": {
+                        "type": "string",
+                        "description": "业务类型标识符（可选，默认使用环境变量配置）"
+                    },
                     "content": {
                         "type": "string",
                         "description": "要添加的文档内容"
@@ -728,11 +1127,15 @@ def get_mcp_tools() -> List[MCPTool]:
             }
         ),
         MCPTool(
-            name="delete_document",
+            name="delete",
             description="从向量数据库中删除指定文档。需要提供与添加时相同的内容和分块参数。",
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "businesstype": {
+                        "type": "string",
+                        "description": "业务类型标识符（可选，默认使用环境变量配置）"
+                    },
                     "content": {
                         "type": "string",
                         "description": "要删除的文档内容"
@@ -756,53 +1159,16 @@ def get_mcp_tools() -> List[MCPTool]:
             }
         ),
         MCPTool(
-            name="batch_add_texts",
-            description="批量添加多个文本到向量数据库。适用于一次性添加多个独立的文本片段。",
+            name="stats",
+            description="获取向量数据库的统计信息，包括向量数量、索引类型等。",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "texts": {
-                        "type": "array",
-                        "description": "要添加的文本列表",
-                        "items": {
-                            "type": "string"
-                        },
-                        "maxItems": 100
+                    "businesstype": {
+                        "type": "string",
+                        "description": "业务类型标识符（可选，默认使用环境变量配置）"
                     }
-                },
-                "required": ["texts"]
-            }
-        ),
-        MCPTool(
-            name="get_stats",
-            description="获取向量数据库的统计信息，包括向量数量、索引类型、优化状态等。",
-            inputSchema={
-                "type": "object",
-                "properties": {}
-            }
-        ),
-        MCPTool(
-            name="enable_optimization",
-            description="启用高级搜索优化功能，包括语义分块、多样性重排序等。",
-            inputSchema={
-                "type": "object",
-                "properties": {}
-            }
-        ),
-        MCPTool(
-            name="get_recommendations",
-            description="获取针对当前数据量和索引类型的搜索优化建议。",
-            inputSchema={
-                "type": "object",
-                "properties": {}
-            }
-        ),
-        MCPTool(
-            name="save_index",
-            description="手动保存当前的向量索引到磁盘。",
-            inputSchema={
-                "type": "object",
-                "properties": {}
+                }
             }
         )
     ]
@@ -810,27 +1176,32 @@ def get_mcp_tools() -> List[MCPTool]:
 
 async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """执行 MCP 工具调用 - 返回标准格式"""
-    global vector_db
-    
-    if vector_db is None:
+    global vector_db_manager
+
+    if vector_db_manager is None:
         return {
             "content": [{
                 "type": "text",
-                "text": json.dumps({"error": "向量数据库未初始化"}, ensure_ascii=False)
+                "text": json.dumps({"error": "向量数据库管理器未初始化"}, ensure_ascii=False)
             }],
             "isError": True
         }
-    
+
+    # 从参数中提取 businesstype
+    businesstype = arguments.get("businesstype") or None
+
     try:
-        if name == "search_knowledge":
+        # 获取适当的数据库实例
+        vector_db = vector_db_manager.get_instance(businesstype)
+
+        if name == "search":
             # 搜索知识
             query = arguments.get("query")
             top_k = arguments.get("top_k", 5)
-            use_optimization = arguments.get("use_optimization", True)
-            
+
             if not query:
                 raise ValueError("query parameter is required")
-            
+
             if vector_db.index.ntotal == 0:
                 return {
                     "content": [{
@@ -842,37 +1213,34 @@ async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, An
                         }, ensure_ascii=False, indent=2)
                     }]
                 }
-            
-            results = vector_db.search(query, top_k, use_optimization)
-            search_method = "optimized" if use_optimization and hasattr(vector_db, 'advanced_search_index') else "traditional"
-            
+
+            results = vector_db.search(query, top_k, use_optimization=False)
+
             response = {
                 "relevant_chunks": [result["text"] for result in results],
                 "detailed_results": results,
                 "query": query,
-                "total_found": len(results),
-                "search_method": search_method,
-                "optimization_enabled": use_optimization
+                "total_found": len(results)
             }
-            
+
             return {
                 "content": [{
                     "type": "text",
                     "text": json.dumps(response, ensure_ascii=False, indent=2)
                 }]
             }
-        
-        elif name == "add_document":
+
+        elif name == "add":
             # 添加文档
             content = arguments.get("content")
             chunk_size = arguments.get("chunk_size", 500)
             chunk_overlap = arguments.get("chunk_overlap", 50)
-            
+
             if not content:
                 raise ValueError("content parameter is required")
-            
+
             chunks = vector_db._generate_chunks(content, chunk_size, chunk_overlap)
-            
+
             if not chunks:
                 return {
                     "content": [{
@@ -883,37 +1251,36 @@ async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, An
                     }],
                     "isError": True
                 }
-            
+
             ids = vector_db.add_texts(chunks)
-            
+
             if config.AUTO_SAVE:
                 vector_db.save()
-            
+
             response = {
                 "message": f"文档处理成功，新增 {len(chunks)} 个知识块",
                 "total_vectors": vector_db.index.ntotal,
-                "chunks_added": len(chunks),
-                "chunk_ids": ids[:5] if len(ids) > 5 else ids
+                "chunks_added": len(chunks)
             }
-            
+
             return {
                 "content": [{
                     "type": "text",
                     "text": json.dumps(response, ensure_ascii=False, indent=2)
                 }]
             }
-        
-        elif name == "delete_document":
+
+        elif name == "delete":
             # 删除文档
             content = arguments.get("content")
             chunk_size = arguments.get("chunk_size", 500)
             chunk_overlap = arguments.get("chunk_overlap", 50)
-            
+
             if not content:
                 raise ValueError("content parameter is required")
-            
+
             chunks = vector_db._generate_chunks(content, chunk_size, chunk_overlap)
-            
+
             if not chunks:
                 return {
                     "content": [{
@@ -924,119 +1291,36 @@ async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, An
                     }],
                     "isError": True
                 }
-            
+
             deleted_count = vector_db.delete_texts(chunks)
-            
+
             if config.AUTO_SAVE and deleted_count > 0:
                 vector_db.save()
-            
+
             response = {
                 "message": f"成功删除 {deleted_count} 个知识块",
                 "total_vectors": vector_db.index.ntotal,
                 "deleted_count": deleted_count
             }
-            
+
             return {
                 "content": [{
                     "type": "text",
                     "text": json.dumps(response, ensure_ascii=False, indent=2)
                 }]
             }
-        
-        elif name == "batch_add_texts":
-            # 批量添加文本
-            texts = arguments.get("texts", [])
-            
-            if not texts:
-                raise ValueError("texts parameter is required")
-            
-            if len(texts) > 100:
-                raise ValueError("Maximum 100 texts allowed per batch")
-            
-            ids = vector_db.add_texts(texts)
-            
-            if config.AUTO_SAVE:
-                vector_db.save()
-            
-            response = {
-                "message": f"批量添加成功，新增 {len(texts)} 个文本",
-                "total_vectors": vector_db.index.ntotal,
-                "added_count": len(ids)
-            }
-            
-            return {
-                "content": [{
-                    "type": "text",
-                    "text": json.dumps(response, ensure_ascii=False, indent=2)
-                }]
-            }
-        
-        elif name == "get_stats":
+
+        elif name == "stats":
             # 获取统计信息
             stats = vector_db.get_stats()
-            
+
             return {
                 "content": [{
                     "type": "text",
                     "text": json.dumps(stats, ensure_ascii=False, indent=2)
                 }]
             }
-        
-        elif name == "enable_optimization":
-            # 启用搜索优化
-            success = vector_db.enable_search_optimization()
-            
-            if success:
-                response = {
-                    "message": "搜索优化已成功启用",
-                    "features": [
-                        "语义感知文本分块",
-                        "动态搜索参数调整",
-                        "多样性重排序(MMR)",
-                        "搜索质量评估",
-                        "相关性阈值过滤"
-                    ]
-                }
-            else:
-                response = {
-                    "error": "启用搜索优化失败"
-                }
-            
-            return {
-                "content": [{
-                    "type": "text",
-                    "text": json.dumps(response, ensure_ascii=False, indent=2)
-                }],
-                "isError": not success
-            }
-        
-        elif name == "get_recommendations":
-            # 获取搜索建议
-            recommendations = vector_db.get_search_recommendations()
-            
-            return {
-                "content": [{
-                    "type": "text",
-                    "text": json.dumps(recommendations, ensure_ascii=False, indent=2)
-                }]
-            }
-        
-        elif name == "save_index":
-            # 手动保存
-            vector_db.save()
-            
-            response = {
-                "message": "索引保存成功",
-                "total_vectors": vector_db.index.ntotal
-            }
-            
-            return {
-                "content": [{
-                    "type": "text",
-                    "text": json.dumps(response, ensure_ascii=False, indent=2)
-                }]
-            }
-        
+
         else:
             raise ValueError(f"Unknown tool: {name}")
     
@@ -1133,10 +1417,15 @@ async def handle_jsonrpc_request(request: JSONRPCRequest) -> JSONRPCResponse:
 # ============================================================================
 
 @app.post("/mcp", tags=["MCP"])
+@app.post("/v1/mcp", tags=["MCP"])  # 支持 /v1/mcp 路径
 async def mcp_jsonrpc_endpoint(request: JSONRPCRequest):
     """
     MCP 标准 JSON-RPC 2.0 端点
-    
+
+    支持的路径:
+    - POST /mcp (标准路径)
+    - POST /v1/mcp (版本化路径)
+
     支持的方法:
     - initialize: 初始化 MCP 连接
     - tools/list: 列出所有可用工具
@@ -1144,13 +1433,13 @@ async def mcp_jsonrpc_endpoint(request: JSONRPCRequest):
     - notifications/initialized: 客户端初始化完成通知
     """
     logger.info(f"收到 JSON-RPC 请求: method={request.method}, id={request.id}")
-    
+
     response = await handle_jsonrpc_request(request)
-    
+
     # 通知类型的请求不返回响应
     if response is None:
         return {"status": "notification_received"}
-    
+
     return response
 
 
@@ -1162,9 +1451,12 @@ async def mcp_jsonrpc_endpoint(request: JSONRPCRequest):
 async def add_document(doc: Document, background_tasks: BackgroundTasks):
     """添加文档到知识库"""
     try:
-        if not vector_db:
-            raise HTTPException(status_code=503, detail="向量数据库未初始化")
-        
+        if not vector_db_manager:
+            raise HTTPException(status_code=503, detail="向量数据库管理器未初始化")
+
+        # 获取适当的数据库实例
+        vector_db = vector_db_manager.get_instance(doc.businesstype)
+
         # 文本分块
         chunks = vector_db._generate_chunks(doc.content, doc.chunk_size, doc.chunk_overlap)
         
@@ -1190,36 +1482,15 @@ async def add_document(doc: Document, background_tasks: BackgroundTasks):
         logger.error(f"添加文档失败: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
-@app.post("/batch_add", summary="批量添加文本", tags=["传统API"])
-async def batch_add_texts(batch: BatchTexts, background_tasks: BackgroundTasks):
-    """批量添加文本"""
-    try:
-        if not vector_db:
-            raise HTTPException(status_code=503, detail="向量数据库未初始化")
-        
-        ids = vector_db.add_texts(batch.texts)
-        
-        if config.AUTO_SAVE:
-            background_tasks.add_task(vector_db.save)
-        
-        return {
-            "message": f"批量添加成功，新增 {len(batch.texts)} 个文本",
-            "total_vectors": vector_db.index.ntotal,
-            "added_count": len(ids)
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"批量添加失败: {e}")
-        raise HTTPException(status_code=500, detail="内部服务器错误")
-
 @app.delete("/delete", summary="删除文档", tags=["传统API"])
 async def delete_document(doc: Document, background_tasks: BackgroundTasks):
     """精确删除文档"""
     try:
-        if not vector_db:
-            raise HTTPException(status_code=503, detail="向量数据库未初始化")
+        if not vector_db_manager:
+            raise HTTPException(status_code=503, detail="向量数据库管理器未初始化")
+
+        # 获取适当的数据库实例
+        vector_db = vector_db_manager.get_instance(doc.businesstype)
         
         # 重新生成相同的分块来精确匹配
         chunks = vector_db._generate_chunks(doc.content, doc.chunk_size, doc.chunk_overlap)
@@ -1248,8 +1519,11 @@ async def delete_document(doc: Document, background_tasks: BackgroundTasks):
 async def search_knowledge(query: Query):
     """搜索相关知识"""
     try:
-        if not vector_db:
-            raise HTTPException(status_code=503, detail="向量数据库未初始化")
+        if not vector_db_manager:
+            raise HTTPException(status_code=503, detail="向量数据库管理器未初始化")
+
+        # 获取适当的数据库实例
+        vector_db = vector_db_manager.get_instance(query.businesstype)
 
         if vector_db.index.ntotal == 0:
             return {"relevant_chunks": [], "message": "知识库为空，请先添加文档"}
@@ -1274,100 +1548,34 @@ async def search_knowledge(query: Query):
         logger.error(f"搜索失败: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
-@app.post("/save", summary="手动保存", tags=["传统API"])
-async def manual_save():
-    """手动保存索引和元数据"""
-    try:
-        if not vector_db:
-            raise HTTPException(status_code=503, detail="向量数据库未初始化")
-        
-        vector_db.save()
-        return {"message": "保存成功"}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"保存失败: {e}")
-        raise HTTPException(status_code=500, detail="保存失败")
-
 @app.get("/stats", summary="获取统计信息", tags=["传统API"])
-async def get_stats():
+async def get_stats(businesstype: Optional[str] = None):
     """获取数据库统计信息"""
     try:
-        if not vector_db:
-            raise HTTPException(status_code=503, detail="向量数据库未初始化")
-        
-        return vector_db.get_stats()
-        
-    except Exception as e:
-        logger.error(f"获取统计信息失败: {e}")
-        raise HTTPException(status_code=500, detail="内部服务器错误")
+        if not vector_db_manager:
+            raise HTTPException(status_code=503, detail="向量数据库管理器未初始化")
 
-@app.post("/enable_optimization", summary="启用搜索优化", tags=["传统API"])
-async def enable_search_optimization():
-    """启用搜索优化功能"""
-    try:
-        if not vector_db:
-            raise HTTPException(status_code=503, detail="向量数据库未初始化")
-
-        success = vector_db.enable_search_optimization()
-        if success:
+        if businesstype:
+            # 获取特定实例的统计信息
+            vector_db = vector_db_manager.get_instance(businesstype)
             return {
-                "message": "搜索优化已成功启用",
-                "features": [
-                    "语义感知文本分块",
-                    "动态搜索参数调整",
-                    "多样性重排序(MMR)",
-                    "搜索质量评估",
-                    "相关性阈值过滤"
-                ]
+                "businesstype": businesstype,
+                **vector_db.get_stats()
             }
         else:
-            raise HTTPException(status_code=500, detail="启用搜索优化失败")
+            # 获取管理器的统计信息
+            return vector_db_manager.get_stats()
 
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"启用搜索优化失败: {e}")
-        raise HTTPException(status_code=500, detail="内部服务器错误")
-
-@app.get("/search_recommendations", summary="获取搜索优化建议", tags=["传统API"])
-async def get_search_recommendations():
-    """获取针对当前数据量的搜索优化建议"""
-    try:
-        if not vector_db:
-            raise HTTPException(status_code=503, detail="向量数据库未初始化")
-
-        recommendations = vector_db.get_search_recommendations()
-        return recommendations
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"获取搜索建议失败: {e}")
-        raise HTTPException(status_code=500, detail="内部服务器错误")
-
-@app.post("/benchmark_search_quality", summary="搜索质量基准测试", tags=["传统API"])
-async def benchmark_search_quality(benchmark: BenchmarkQueries):
-    """对比传统搜索和优化搜索的质量差异"""
-    try:
-        if not vector_db:
-            raise HTTPException(status_code=503, detail="向量数据库未初始化")
-
-        results = vector_db.benchmark_search_quality(benchmark.queries)
-        return results
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"基准测试失败: {e}")
+        logger.error(f"获取统计信息失败: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
 
 @app.get("/health", summary="健康检查", tags=["系统"])
 async def health_check():
     """健康检查端点"""
+    manager_stats = vector_db_manager.get_stats() if vector_db_manager else {}
     return {
-        "status": "healthy" if vector_db else "initializing",
+        "status": "healthy" if vector_db_manager else "initializing",
         "mcp_enabled": True,
         "mcp_protocol": "JSON-RPC 2.0",
         "mcp_protocol_version": "2024-11-05",
@@ -1378,7 +1586,8 @@ async def health_check():
         "features": {
             "mcp_protocol": True,
             "rest_api": True,
-            "search_optimization": hasattr(vector_db, 'advanced_search_index') if vector_db else False
+            "multi_business_type": True,
+            "manager_stats": manager_stats
         }
     }
 
