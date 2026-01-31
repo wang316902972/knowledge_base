@@ -538,11 +538,11 @@ class FaissVectorDB:
                 # Add quality metrics to first result only
                 if i == 0:
                     result_dict["quality_metrics"] = {
-                        "avg_relevance_score": quality_metrics.avg_relevance_score,
-                        "diversity_score": quality_metrics.diversity_score,
-                        "coverage_ratio": quality_metrics.coverage_ratio,
-                        "precision_at_k": quality_metrics.precision_at_k,
-                        "total_results": quality_metrics.total_results
+                        "avg_relevance_score": float(quality_metrics.avg_relevance_score),
+                        "diversity_score": float(quality_metrics.diversity_score),
+                        "coverage_ratio": float(quality_metrics.coverage_ratio),
+                        "precision_at_k": float(quality_metrics.precision_at_k),
+                        "total_results": int(quality_metrics.total_results)
                     }
 
                 formatted_results.append(result_dict)
@@ -669,7 +669,143 @@ class FaissVectorDB:
             except Exception as e:
                 logger.error(f"删除文本失败: {e}")
                 raise HTTPException(status_code=500, detail=f"删除文本失败: {str(e)}")
-    
+
+    def update_texts(self, updates: List[Dict[str, str]]) -> Dict[str, Any]:
+        """
+        批量更新文本（upsert 语义）
+
+        Args:
+            updates: 更新列表，每项包含 {
+                "old_text": "原始文本内容",
+                "new_text": "新文本内容"
+            }
+
+        Returns:
+            {
+                "success_count": int,      # 成功更新数量
+                "failed_count": int,       # 失败数量
+                "inserted_count": int,     # 新增数量（old_text 不存在）
+                "updated_count": int,      # 更新数量（找到并替换）
+                "errors": List[Dict]       # 失败详情 [{index, old_text, error}]
+            }
+        """
+        with self.lock:
+            try:
+                errors = []
+                old_ids_to_remove = []
+                all_new_texts = []
+                update_indices = []  # 跟踪哪些是更新，哪些是新增
+
+                logger.info(f"开始处理 {len(updates)} 个更新请求...")
+
+                # Step 1: 查找阶段 - 分类为"更新"或"新增"
+                for i, update in enumerate(updates):
+                    try:
+                        old_text = update.get("old_text", "").strip()
+                        new_text = update.get("new_text", "").strip()
+
+                        # 验证输入
+                        if not old_text or not new_text:
+                            errors.append({
+                                "index": i,
+                                "old_text": old_text[:100] + "..." if len(old_text) > 100 else old_text,
+                                "error": "文本内容为空"
+                            })
+                            continue
+
+                        # 跳过相同文本
+                        if old_text == new_text:
+                            logger.debug(f"索引 {i}: 旧文本和新文本相同，跳过")
+                            continue
+
+                        # 查找旧文本
+                        if old_text in self.chunk_to_id:
+                            # 找到了，标记为更新
+                            faiss_id = int(self.chunk_to_id[old_text])
+                            old_ids_to_remove.append(faiss_id)
+                            all_new_texts.append(new_text)
+                            update_indices.append({"type": "update", "index": i})
+                            logger.debug(f"索引 {i}: 找到旧文本 (FAISS ID: {faiss_id})，将更新")
+                        else:
+                            # 未找到，标记为新增
+                            all_new_texts.append(new_text)
+                            update_indices.append({"type": "insert", "index": i})
+                            logger.debug(f"索引 {i}: 未找到旧文本，将新增")
+
+                    except Exception as e:
+                        errors.append({
+                            "index": i,
+                            "old_text": update.get("old_text", "")[:100],
+                            "error": str(e)
+                        })
+                        logger.error(f"处理索引 {i} 时出错: {e}")
+
+                if not all_new_texts:
+                    logger.info("没有需要处理的新文本")
+                    return {
+                        "success_count": 0,
+                        "failed_count": len(errors),
+                        "inserted_count": 0,
+                        "updated_count": 0,
+                        "errors": errors
+                    }
+
+                # Step 2: 批量删除旧向量
+                if old_ids_to_remove:
+                    logger.info(f"删除 {len(old_ids_to_remove)} 个旧向量...")
+                    self.index.remove_ids(np.array(old_ids_to_remove, dtype=np.int64))
+
+                    # 从元数据中删除旧的映射
+                    for faiss_id in old_ids_to_remove:
+                        faiss_id_str = str(faiss_id)
+                        if faiss_id_str in self.id_to_chunk:
+                            old_text = self.id_to_chunk[faiss_id_str]
+                            del self.id_to_chunk[faiss_id_str]
+                            if old_text in self.chunk_to_id:
+                                del self.chunk_to_id[old_text]
+
+                # Step 3: 批量生成嵌入向量
+                logger.info(f"为 {len(all_new_texts)} 个新文本生成嵌入向量...")
+                embeddings = self.embedding_model.encode(
+                    all_new_texts,
+                    convert_to_numpy=True,
+                    show_progress_bar=False,
+                    normalize_embeddings=True,
+                    batch_size=self.config.BATCH_SIZE
+                )
+
+                # Step 4: 批量添加新向量
+                logger.info(f"添加 {len(embeddings)} 个新向量到索引...")
+                self.index.add(embeddings)
+
+                # Step 5: 更新元数据
+                start_faiss_id = self.index.ntotal - len(all_new_texts)
+                for i, (new_text, update_info) in enumerate(zip(all_new_texts, update_indices)):
+                    faiss_id = start_faiss_id + i
+                    self.id_to_chunk[str(faiss_id)] = new_text
+                    self.chunk_to_id[new_text] = str(faiss_id)
+
+                self.dirty = True
+
+                # 统计结果
+                inserted_count = sum(1 for u in update_indices if u["type"] == "insert")
+                updated_count = sum(1 for u in update_indices if u["type"] == "update")
+                success_count = inserted_count + updated_count
+
+                logger.info(f"更新完成: 成功 {success_count}, 新增 {inserted_count}, 更新 {updated_count}, 失败 {len(errors)}")
+
+                return {
+                    "success_count": success_count,
+                    "failed_count": len(errors),
+                    "inserted_count": inserted_count,
+                    "updated_count": updated_count,
+                    "errors": errors
+                }
+
+            except Exception as e:
+                logger.error(f"批量更新失败: {e}")
+                raise HTTPException(status_code=500, detail=f"批量更新失败: {str(e)}")
+
     def save(self):
         """保存索引和元数据"""
         with self.lock:
@@ -677,6 +813,10 @@ class FaissVectorDB:
                 if not self.dirty:
                     logger.info("没有更改，跳过保存")
                     return
+
+                # 确保数据目录存在
+                os.makedirs(self.data_dir, exist_ok=True)
+                logger.debug(f"确保数据目录存在: {self.data_dir}")
 
                 # 原子性保存：先保存到临时文件
                 temp_index_file = f"{self.index_file}.tmp"
@@ -1026,6 +1166,18 @@ class BenchmarkQueries(BaseModel):
 
 class BatchTexts(BaseModel):
     texts: List[str] = Field(..., description="批量文本列表", max_length=100)
+    businesstype: Optional[str] = Field(None, description="业务类型标识符", pattern="^[a-zA-Z0-9_-]{1,50}$")
+
+
+class TextUpdate(BaseModel):
+    """单个文本更新请求"""
+    old_text: str = Field(..., description="原始文本内容", min_length=1, max_length=50000)
+    new_text: str = Field(..., description="新文本内容", min_length=1, max_length=50000)
+
+
+class UpdateRequest(BaseModel):
+    """批量更新文档请求"""
+    updates: List[TextUpdate] = Field(..., description="更新列表", min_length=1, max_length=100)
     businesstype: Optional[str] = Field(None, description="业务类型标识符", pattern="^[a-zA-Z0-9_-]{1,50}$")
 
 
@@ -1514,6 +1666,48 @@ async def delete_document(doc: Document, background_tasks: BackgroundTasks):
     except Exception as e:
         logger.error(f"删除文档失败: {e}")
         raise HTTPException(status_code=500, detail="内部服务器错误")
+
+@app.put("/update", summary="更新文档", tags=["传统API"])
+async def update_documents(request: UpdateRequest, background_tasks: BackgroundTasks):
+    """
+    批量更新文档（upsert 语义）
+
+    - 如果 old_text 存在，则更新为新文本
+    - 如果 old_text 不存在，则插入新文本
+    - 支持批量操作，最多100条
+    - 返回详细的统计信息
+    """
+    try:
+        if not vector_db_manager:
+            raise HTTPException(status_code=503, detail="向量数据库管理器未初始化")
+
+        # 获取适当的数据库实例
+        vector_db = vector_db_manager.get_instance(request.businesstype)
+
+        # 准备更新数据
+        updates = [
+            {"old_text": u.old_text, "new_text": u.new_text}
+            for u in request.updates
+        ]
+
+        # 执行更新
+        result = vector_db.update_texts(updates)
+
+        # 后台保存（如果启用自动保存）
+        if config.AUTO_SAVE and result["success_count"] > 0:
+            background_tasks.add_task(vector_db.save)
+
+        return {
+            "message": f"更新完成: 成功 {result['success_count']}, 新增 {result['inserted_count']}, 更新 {result['updated_count']}, 失败 {result['failed_count']}",
+            "total_vectors": vector_db.index.ntotal,
+            **result
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"更新文档失败: {e}")
+        raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
 
 @app.post("/search", summary="搜索知识", tags=["传统API"])
 async def search_knowledge(query: Query):
