@@ -1,34 +1,54 @@
+"""
+FAISS向量数据库服务器 - 优化版本
+
+提供高性能的向量搜索、文档管理和检索增强功能。
+支持业务类型隔离、混合检索、查询优化等高级特性。
+
+Example:
+    >>> from config import get_config
+    >>> from faiss_server_optimized import FaissVectorDB
+    >>> config = get_config()
+    >>> db = FaissVectorDB(config)
+    >>> results = await db.search("查询文本", top_k=5)
+"""
 import faiss
-import numpy as np
 import json
-import logging
+import os
 import threading
+import time
 import uuid
 import asyncio
-import os
-import time
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Sequence, Union
 from contextlib import asynccontextmanager
+
+import numpy as np
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from sentence_transformers import SentenceTransformer
-from config import get_config, Config
-from search_optimization import AdvancedSearchIndex, QualityMetrics
-from retrieval_enhancement import (
-    RetrievalEnhancementCoordinator,
-    EnhancedQuery,
-    SearchResult,
-    QualityMetrics as EnhancedQualityMetrics
-)
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+from config import get_config, Config
+from exceptions import (
+    DatabaseError,
+    DatabaseInitError,
+    DatabaseSearchError,
+    EmbeddingError,
+    DimensionMismatchError,
+    SearchError,
+    ValidationError,
 )
-logger = logging.getLogger(__name__)
+from logger import setup_logger
+from retrieval_enhancement import (
+    EnhancedQuery,
+    QualityMetrics as EnhancedQualityMetrics,
+    RetrievalEnhancementCoordinator,
+    SearchResult,
+)
+from search_optimization import AdvancedSearchIndex, QualityMetrics
+
+# 初始化日志
+logger = setup_logger(__name__)
 
 # 设置 Hugging Face 镜像（中国网络优化）
 # 优先使用环境变量 HF_ENDPOINT，否则使用默认镜像
@@ -439,13 +459,23 @@ class FaissVectorDB:
                             )
 
             # Step 3: Apply exact field matching as fallback (if enabled)
-            if self.config.ENABLE_EXACT_MATCH_FALLBACK and len(all_results) < top_k:
+            # 修改逻辑：如果向量搜索结果相关性普遍较低（<0.3），也启用精确匹配
+            avg_relevance = np.mean([r.relevance_score for r in all_results.values()]) if all_results else 0.0
+            use_exact_fallback = (
+                self.config.ENABLE_EXACT_MATCH_FALLBACK and
+                (len(all_results) < top_k or avg_relevance < 0.3)
+            )
+
+            if use_exact_fallback:
                 exact_results = self._execute_exact_match_search(query, top_k)
+                logger.info(f"Applying exact match fallback (results: {len(all_results)}, avg_relevance: {avg_relevance:.3f})")
                 for result_dict in exact_results:
                     faiss_id = result_dict['faiss_id']
                     if faiss_id in all_results:
                         if 'exact' not in all_results[faiss_id].strategies_used:
                             all_results[faiss_id].strategies_used.append('exact')
+                            # 提升精确匹配的相关性分数
+                            all_results[faiss_id].relevance_score = max(all_results[faiss_id].relevance_score, 0.8)
                     else:
                         all_results[faiss_id] = SearchResult(
                             text=result_dict['text'],
@@ -1145,8 +1175,8 @@ app.add_middleware(
 class Document(BaseModel):
     content: str = Field(..., description="文档内容", max_length=50000)
     businesstype: Optional[str] = Field(None, description="业务类型标识符", pattern="^[a-zA-Z0-9_-]{1,50}$")
-    chunk_size: int = Field(default=500, description="分块大小", ge=50, le=2000)
-    chunk_overlap: int = Field(default=50, description="分块重叠", ge=0, le=500)
+    chunk_size: int = Field(default=500, description="分块大小", ge=50, le=100000)
+    chunk_overlap: int = Field(default=50, description="分块重叠", ge=0, le=10000)
 
     @field_validator('chunk_overlap')
     @classmethod
