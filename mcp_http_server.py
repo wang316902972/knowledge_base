@@ -5,7 +5,7 @@ FAISS Vector Database MCP HTTP Server
 """
 import asyncio
 import json
-import logging
+from logger import setup_logger
 from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,11 +16,7 @@ from config import get_config, Config
 from faiss_server_optimized import FaissVectorDB
 
 # 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+logger = setup_logger(__name__)
 
 # 初始化配置和向量数据库
 config = get_config()

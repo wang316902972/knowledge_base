@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 MCP工具包 - 提供高级连接池管理和工具调用功能
+
 特性:
 - 连接池管理
 - 自动重试机制
@@ -8,24 +9,32 @@ MCP工具包 - 提供高级连接池管理和工具调用功能
 - 工具调用代理
 - 批量操作
 - 性能监控
+
+Example:
+    >>> from mcp_toolkit import MCPToolkit, PoolConfig
+    >>> toolkit = MCPToolkit(
+    ...     mcp_url="http://localhost:8003",
+    ...     pool_config=PoolConfig(min_size=2, max_size=5)
+    ... )
+    >>> result = await toolkit.search("AI技术", top_k=5)
+    >>> await toolkit.close()
 """
 
 import asyncio
 import json
-import logging
 import time
 from typing import Any, Dict, List, Optional, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
 import functools
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# 导入统一异常和日志模块
+from exceptions import MCPError, MCPConnectionError, MCPTimeoutError, ErrorCode
+from logger import setup_logger
+
+# 初始化日志
+logger = setup_logger(__name__)
 
 
 class CircuitState(Enum):
@@ -106,18 +115,49 @@ class Metrics:
 
 
 class CircuitBreaker:
-    """熔断器实现"""
+    """熔断器实现
 
-    def __init__(self, config: CircuitBreakerConfig):
+    实现熔断器模式以防止级联故障。
+
+    Attributes:
+        config: 熔断器配置
+        state: 当前熔断器状态
+        failure_count: 失败计数
+        success_count: 成功计数
+        last_failure_time: 最后失败时间
+
+    Example:
+        >>> breaker = CircuitBreaker(CircuitBreakerConfig())
+        >>> result = await breaker.call(some_function, arg1, arg2)
+    """
+
+    def __init__(self, config: CircuitBreakerConfig) -> None:
+        """初始化熔断器
+
+        Args:
+            config: 熔断器配置
+        """
         self.config = config
         self.state = CircuitState.CLOSED
-        self.failure_count = 0
-        self.success_count = 0
+        self.failure_count: int = 0
+        self.success_count: int = 0
         self.last_failure_time: Optional[datetime] = None
         self._lock = asyncio.Lock()
 
-    async def call(self, func: Callable, *args, **kwargs) -> Any:
-        """通过熔断器调用函数"""
+    async def call(self, func: Callable, *args: Any, **kwargs: Any) -> Any:
+        """通过熔断器调用函数
+
+        Args:
+            func: 要调用的函数
+            *args: 位置参数
+            **kwargs: 关键字参数
+
+        Returns:
+            函数执行结果
+
+        Raises:
+            MCPError: 当熔断器打开时
+        """
         async with self._lock:
             if self.state == CircuitState.OPEN:
                 # 检查是否可以尝试恢复
@@ -127,7 +167,10 @@ class CircuitBreaker:
                     self.state = CircuitState.HALF_OPEN
                     logger.info("熔断器进入半开状态")
                 else:
-                    raise Exception("熔断器打开，拒绝请求")
+                    raise MCPError(
+                        message="熔断器打开，拒绝请求",
+                        code=ErrorCode.MCP_UNAVAILABLE
+                    )
 
         try:
             result = await func(*args, **kwargs)

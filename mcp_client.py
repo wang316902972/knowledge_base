@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
 """
-MCP (Model Context Protocol) Client Utility
-基于 test_mcp_with_session.py 封装的 MCP 客户端工具
-"""
+MCP (Model Context Protocol) 客户端工具
 
+提供与 MCP 服务通信的功能，支持同步和异步调用。
+基于 test_mcp_with_session.py 封装。
+
+Example:
+    >>> from mcp_client import MCPClient, create_mcp_client
+    >>> client = create_mcp_client("http://localhost:8003")
+    >>> await client.initialize_async()
+    >>> result = await client.search_async("查询", top_k=5)
+"""
 import json
 import time
 import asyncio
-import logging
-from typing import Dict, Any, Optional, Union
+from typing import Dict, Any, Optional, Union, List
+
 import requests
+
+from exceptions import MCPError, MCPConnectionError, MCPTimeoutError, ErrorCode
+from logger import setup_logger
 
 # httpx 是可选依赖
 try:
@@ -19,7 +29,8 @@ except ImportError:
     HTTPX_AVAILABLE = False
     httpx = None
 
-logger = logging.getLogger(__name__)
+# 初始化日志
+logger = setup_logger(__name__)
 
 
 class MCPClient:
