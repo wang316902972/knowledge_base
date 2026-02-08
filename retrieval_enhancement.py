@@ -5,7 +5,7 @@ Improves vector search accuracy through hybrid retrieval, adaptive thresholding,
 """
 
 import json
-import logging
+from logger import setup_logger
 import re
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple, Union
@@ -23,7 +23,7 @@ except ImportError:
     BM25SearchStrategy = None
     BM25SearchResult = None
 
-logger = logging.getLogger(__name__)
+logger = setup_logger(__name__)
 
 
 @dataclass
@@ -420,18 +420,18 @@ class QualityMetricsCalculator:
 
         # Coverage ratio (high-quality results proportion)
         high_quality_count = sum(1 for r in results if r.relevance_score > 0.7)
-        coverage_ratio = high_quality_count / len(results) if results else 0.0
+        coverage_ratio = float(high_quality_count / len(results)) if results else 0.0
 
         # Precision@k (results with relevance > 0.6)
         precision_count = sum(1 for r in results if r.relevance_score > 0.6)
-        precision_at_k = precision_count / len(results) if results else 0.0
+        precision_at_k = float(precision_count / len(results)) if results else 0.0
 
         return QualityMetrics(
-            avg_relevance_score=avg_relevance,
-            diversity_score=diversity_score,
-            coverage_ratio=coverage_ratio,
-            precision_at_k=precision_at_k,
-            total_results=len(results),
+            avg_relevance_score=float(avg_relevance),
+            diversity_score=float(diversity_score),
+            coverage_ratio=float(coverage_ratio),
+            precision_at_k=float(precision_at_k),
+            total_results=int(len(results)),
             strategies_used=list(set(s for r in results for s in r.strategies_used))
         )
 
@@ -459,7 +459,7 @@ class QualityMetricsCalculator:
                     total_distance += distance
                     count += 1
 
-            return total_distance / count if count > 0 else 0.0
+            return float(total_distance / count) if count > 0 else 0.0
         except Exception as e:
             logger.warning(f"Failed to calculate diversity: {e}")
             return 0.0

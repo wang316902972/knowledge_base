@@ -1,11 +1,17 @@
 """
 FAISS Vector Database MCP Server
-基于 Model Context Protocol 的向量搜索服务
+
+基于 Model Context Protocol 的向量搜索服务。
+提供语义搜索、文档管理等功能，支持业务类型隔离。
+
+Example:
+    >>> python mcp_server.py
+    >>> # 通过 stdio 与 MCP 客户端通信
 """
 import asyncio
 import json
-import logging
-from typing import Any, Sequence
+from typing import Any, Sequence, Optional
+
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import (
@@ -16,15 +22,12 @@ from mcp.types import (
 )
 from pydantic import BaseModel, Field
 
-from config import get_config
+from config import get_config, Config
 from faiss_server_optimized import FaissVectorDB
+from logger import setup_logger
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# 初始化日志
+logger = setup_logger(__name__)
 
 # 初始化配置和向量数据库
 config = get_config()
