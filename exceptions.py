@@ -122,18 +122,22 @@ class ConfigValidationError(ConfigError):
         message: str,
         parameter: Optional[str] = None,
         value: Optional[Any] = None,
+        details: Optional[Dict[str, Any]] = None,
         cause: Optional[Exception] = None,
     ) -> None:
-        details = {}
+        # 合并 details 字典
+        merged_details = details or {}
+
+        # 如果指定了 parameter 或 value，添加到 details 中
         if parameter:
-            details["parameter"] = parameter
+            merged_details["parameter"] = parameter
         if value is not None:
-            details["value"] = str(value)
+            merged_details["value"] = str(value)
 
         super().__init__(
             message=message,
             code=ErrorCode.CONFIG_VALIDATION,
-            details=details if details else None,
+            details=merged_details if merged_details else None,
             cause=cause,
         )
 
