@@ -16,7 +16,6 @@ import json
 import os
 import threading
 import time
-import uuid
 import asyncio
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Sequence, Union
@@ -39,6 +38,7 @@ from exceptions import (
     ValidationError,
 )
 from logger import setup_logger
+from metadata_store import SQLiteMetadataStore
 from retrieval_enhancement import (
     EnhancedQuery,
     QualityMetrics as EnhancedQualityMetrics,
@@ -79,6 +79,11 @@ class FaissVectorDB:
         self.index_file = config.get_index_file(self.businesstype)
         self.metadata_file = config.get_metadata_file(self.businesstype)
         self.data_dir = os.path.join(config.DATA_DIR, self.businesstype)
+        self.sqlite_metadata_file = os.path.join(
+            self.data_dir,
+            f"{self.businesstype}_metadata.sqlite",
+        )
+        self.metadata_store: Optional[SQLiteMetadataStore] = None
 
         self._initialize()
     
@@ -95,6 +100,7 @@ class FaissVectorDB:
 
             # 确保数据目录存在
             os.makedirs(self.data_dir, exist_ok=True)
+            self.metadata_store = SQLiteMetadataStore(self.sqlite_metadata_file)
 
             # 优先尝试使用本地缓存的模型
             # 构造模型本地路径
@@ -146,26 +152,62 @@ class FaissVectorDB:
         """根据配置创建FAISS索引"""
         if self.config.INDEX_TYPE == "FlatIP":
             logger.info(f"创建 FlatIP 索引，维度: {self.config.EMBEDDING_DIM}")
-            return faiss.IndexFlatIP(self.config.EMBEDDING_DIM)
+            return self._wrap_index_with_id_map(faiss.IndexFlatIP(self.config.EMBEDDING_DIM))
         elif self.config.INDEX_TYPE == "FlatL2":
             logger.info(f"创建 FlatL2 索引，维度: {self.config.EMBEDDING_DIM}")
-            return faiss.IndexFlatL2(self.config.EMBEDDING_DIM)
+            return self._wrap_index_with_id_map(faiss.IndexFlatL2(self.config.EMBEDDING_DIM))
         elif self.config.INDEX_TYPE == "IVFFlat":
             # IVF索引需要训练
             logger.info(f"创建 IVFFlat 索引，维度: {self.config.EMBEDDING_DIM}, nlist: {self.config.NLIST}")
             quantizer = faiss.IndexFlatL2(self.config.EMBEDDING_DIM)
             index = faiss.IndexIVFFlat(quantizer, self.config.EMBEDDING_DIM, self.config.NLIST)
-            return index
+            return self._wrap_index_with_id_map(index)
         elif self.config.INDEX_TYPE == "HNSW":
             # HNSW索引
             logger.info(f"创建 HNSW 索引，维度: {self.config.EMBEDDING_DIM}, M: {self.config.M}")
             index = faiss.IndexHNSWFlat(self.config.EMBEDDING_DIM, self.config.M)
             index.hnsw.efConstruction = self.config.EF_CONSTRUCTION
             index.hnsw.efSearch = self.config.EF_SEARCH
-            return index
+            return self._wrap_index_with_id_map(index)
         else:
             logger.warning(f"未知索引类型 {self.config.INDEX_TYPE}，使用默认 FlatIP")
-            return faiss.IndexFlatIP(self.config.EMBEDDING_DIM)
+            return self._wrap_index_with_id_map(faiss.IndexFlatIP(self.config.EMBEDDING_DIM))
+
+    def _wrap_index_with_id_map(self, index):
+        """Wrap FAISS index with stable external IDs when supported."""
+        if hasattr(faiss, "IndexIDMap2"):
+            return faiss.IndexIDMap2(index)
+        if hasattr(faiss, "IndexIDMap"):
+            return faiss.IndexIDMap(index)
+        logger.warning("当前 FAISS 版本不支持 IndexIDMap，回退到顺序 ID 模式")
+        return index
+
+    def _supports_stable_vector_ids(self) -> bool:
+        return hasattr(self.index, "add_with_ids")
+
+    def _sync_active_metadata_cache(self) -> None:
+        """Refresh in-memory maps used by search, BM25, and legacy responses."""
+        if not self.metadata_store:
+            return
+        self.id_to_chunk = self.metadata_store.get_active_text_map()
+        self.chunk_to_id = self.metadata_store.get_chunk_to_id_map()
+
+    def _add_embeddings_with_ids(self, embeddings, vector_ids: List[int]) -> None:
+        id_array = np.array(vector_ids, dtype=np.int64)
+        if self._supports_stable_vector_ids():
+            self.index.add_with_ids(embeddings, id_array)
+            return
+        self.index.add(embeddings)
+
+    def _is_active_vector_id(self, vector_id: int) -> bool:
+        if self.metadata_store:
+            return self.metadata_store.is_active(vector_id)
+        return str(vector_id) in self.id_to_chunk
+
+    def _get_text_for_vector_id(self, vector_id: int) -> Optional[str]:
+        if self.metadata_store:
+            return self.metadata_store.get_text(vector_id)
+        return self.id_to_chunk.get(str(vector_id))
     
     def _create_or_load_index(self):
         """创建或加载索引"""
@@ -222,7 +264,7 @@ class FaissVectorDB:
             logger.warning(f"IVF索引初始化训练失败: {e}")
             logger.info("切换到FlatIP索引以避免训练问题...")
             # 回退到简单的FlatIP索引
-            self.index = faiss.IndexFlatIP(self.config.EMBEDDING_DIM)
+            self.index = self._wrap_index_with_id_map(faiss.IndexFlatIP(self.config.EMBEDDING_DIM))
 
     def _generate_chunks(self, content: str, chunk_size: int, chunk_overlap: int) -> List[str]:
         """改进的文本分块逻辑 - 支持传统和语义分块"""
@@ -277,24 +319,26 @@ class FaissVectorDB:
                         logger.warning(f"IVF索引训练需要至少 {min_train_size} 个向量，当前只有 {len(texts)} 个")
                         logger.warning("切换到FlatIP索引以避免训练问题...")
                         # 自动切换到FlatIP索引
-                        self.index = faiss.IndexFlatIP(self.config.EMBEDDING_DIM)
+                        self.index = self._wrap_index_with_id_map(faiss.IndexFlatIP(self.config.EMBEDDING_DIM))
 
-                # 生成唯一ID
-                ids = [str(uuid.uuid4()) for _ in texts]
+                # 先由 SQLite 分配稳定 vector_id，再写入 FAISS。
+                vector_ids = self.metadata_store.add_chunks(texts) if self.metadata_store else []
+                if not vector_ids:
+                    start_faiss_id = self.index.ntotal
+                    vector_ids = [start_faiss_id + i for i in range(len(texts))]
 
-                # 添加到索引
-                self.index.add(embeddings)
-
-                # 更新元数据
-                start_faiss_id = self.index.ntotal - len(texts)
-                for i, (text, unique_id) in enumerate(zip(texts, ids)):
-                    faiss_id = start_faiss_id + i
-                    self.id_to_chunk[str(faiss_id)] = text
-                    self.chunk_to_id[text] = str(faiss_id)
+                try:
+                    self._add_embeddings_with_ids(embeddings, vector_ids)
+                except Exception:
+                    if self.metadata_store and vector_ids:
+                        self.metadata_store.soft_delete_vector_ids(vector_ids)
+                        self._sync_active_metadata_cache()
+                    raise
+                self._sync_active_metadata_cache()
 
                 self.dirty = True
                 logger.info(f"成功添加 {len(texts)} 个文本块，总向量数: {self.index.ntotal}")
-                return ids
+                return [str(vector_id) for vector_id in vector_ids]
 
             except Exception as e:
                 logger.error(f"添加文本失败: {e}")
@@ -359,18 +403,21 @@ class FaissVectorDB:
             self.index.hnsw.efSearch = max(self.config.EF_SEARCH, 100)
 
         # 搜索，使用更大的候选集以提高精度
-        search_k = min(top_k * 4, self.index.ntotal)  # 增加候选数量
+        # 软删除会留下 inactive 向量，候选集需要适度放大后再过滤。
+        search_k = min(max(top_k * 8, top_k), self.index.ntotal)
         distances, indices = self.index.search(query_embedding, search_k)
 
         # 构建结果并添加基本的相关性过滤
         results = []
         for dist, idx in zip(distances[0], indices[0]):
-            if idx != -1 and str(idx) in self.id_to_chunk:
+            if idx != -1 and self._is_active_vector_id(int(idx)):
                 # 处理可能的无效浮点值
                 score = float(dist)
                 if not (score == float('inf') or score == float('-inf') or score != score):  # 检查 inf, -inf, nan
                     # 基本的文本相关性检查：确保查询词在结果中
-                    text = self.id_to_chunk[str(idx)]
+                    text = self._get_text_for_vector_id(int(idx))
+                    if text is None:
+                        continue
                     query_terms = set(query.lower().split())
                     text_lower = text.lower()
 
@@ -617,10 +664,12 @@ class FaissVectorDB:
         # Build results
         results = []
         for dist, idx in zip(distances[0], indices[0]):
-            if idx != -1 and str(idx) in self.id_to_chunk:
+            if idx != -1 and self._is_active_vector_id(int(idx)):
                 score = float(dist)
                 if not (score == float('inf') or score == float('-inf') or score != score):
-                    text = self.id_to_chunk[str(idx)]
+                    text = self._get_text_for_vector_id(int(idx))
+                    if text is None:
+                        continue
 
                     # Calculate relevance score (cosine similarity)
                     # For normalized vectors, FAISS distance ≈ 1 - cosine_similarity
@@ -642,6 +691,7 @@ class FaissVectorDB:
         query_lower = query.lower()
 
         # Get all chunks
+        self._sync_active_metadata_cache()
         for faiss_id_str, text in self.id_to_chunk.items():
             faiss_id = int(faiss_id_str)
             text_lower = text.lower()
@@ -667,34 +717,45 @@ class FaissVectorDB:
         return results[:top_k]
     
     def delete_texts(self, texts_to_delete: List[str]) -> int:
-        """精确删除指定文本"""
+        """精确删除指定文本。
+
+        百万级知识库采用软删除：FAISS 向量保留到下一次 compaction，
+        查询阶段通过 SQLite active 状态过滤。
+        """
         with self.lock:
             try:
-                ids_to_remove = []
-                for text in texts_to_delete:
-                    if text in self.chunk_to_id:
-                        faiss_id = self.chunk_to_id[text]
-                        ids_to_remove.append(int(faiss_id))
-                
-                if not ids_to_remove:
+                if not self.metadata_store:
+                    ids_to_remove = []
+                    for text in texts_to_delete:
+                        if text in self.chunk_to_id:
+                            faiss_id = self.chunk_to_id[text]
+                            ids_to_remove.append(int(faiss_id))
+
+                    if not ids_to_remove:
+                        logger.info("未找到要删除的文本")
+                        return 0
+
+                    self.index.remove_ids(np.array(ids_to_remove, dtype=np.int64))
+                    for faiss_id in ids_to_remove:
+                        faiss_id_str = str(faiss_id)
+                        if faiss_id_str in self.id_to_chunk:
+                            text = self.id_to_chunk[faiss_id_str]
+                            del self.id_to_chunk[faiss_id_str]
+                            if text in self.chunk_to_id:
+                                del self.chunk_to_id[text]
+
+                    self.dirty = True
+                    return len(ids_to_remove)
+
+                deleted_ids = self.metadata_store.soft_delete_texts(texts_to_delete)
+                if not deleted_ids:
                     logger.info("未找到要删除的文本")
                     return 0
-                
-                # 从FAISS索引删除
-                self.index.remove_ids(np.array(ids_to_remove, dtype=np.int64))
-                
-                # 从元数据删除
-                for faiss_id in ids_to_remove:
-                    faiss_id_str = str(faiss_id)
-                    if faiss_id_str in self.id_to_chunk:
-                        text = self.id_to_chunk[faiss_id_str]
-                        del self.id_to_chunk[faiss_id_str]
-                        if text in self.chunk_to_id:
-                            del self.chunk_to_id[text]
-                
+
+                self._sync_active_metadata_cache()
                 self.dirty = True
-                logger.info(f"成功删除 {len(ids_to_remove)} 个文本块")
-                return len(ids_to_remove)
+                logger.info(f"成功软删除 {len(deleted_ids)} 个文本块")
+                return len(deleted_ids)
                 
             except Exception as e:
                 logger.error(f"删除文本失败: {e}")
@@ -722,7 +783,7 @@ class FaissVectorDB:
         with self.lock:
             try:
                 errors = []
-                old_ids_to_remove = []
+                old_ids_to_deactivate = []
                 all_new_texts = []
                 update_indices = []  # 跟踪哪些是更新，哪些是新增
 
@@ -748,14 +809,18 @@ class FaissVectorDB:
                             logger.debug(f"索引 {i}: 旧文本和新文本相同，跳过")
                             continue
 
-                        # 查找旧文本
-                        if old_text in self.chunk_to_id:
+                        # 查找旧文本。SQLite store 会返回所有 active exact-match chunk。
+                        active_ids = (
+                            self.metadata_store.get_active_ids_for_text(old_text)
+                            if self.metadata_store
+                            else ([int(self.chunk_to_id[old_text])] if old_text in self.chunk_to_id else [])
+                        )
+                        if active_ids:
                             # 找到了，标记为更新
-                            faiss_id = int(self.chunk_to_id[old_text])
-                            old_ids_to_remove.append(faiss_id)
+                            old_ids_to_deactivate.extend(active_ids)
                             all_new_texts.append(new_text)
                             update_indices.append({"type": "update", "index": i})
-                            logger.debug(f"索引 {i}: 找到旧文本 (FAISS ID: {faiss_id})，将更新")
+                            logger.debug(f"索引 {i}: 找到旧文本 (vector_ids: {active_ids})，将更新")
                         else:
                             # 未找到，标记为新增
                             all_new_texts.append(new_text)
@@ -780,21 +845,7 @@ class FaissVectorDB:
                         "errors": errors
                     }
 
-                # Step 2: 批量删除旧向量
-                if old_ids_to_remove:
-                    logger.info(f"删除 {len(old_ids_to_remove)} 个旧向量...")
-                    self.index.remove_ids(np.array(old_ids_to_remove, dtype=np.int64))
-
-                    # 从元数据中删除旧的映射
-                    for faiss_id in old_ids_to_remove:
-                        faiss_id_str = str(faiss_id)
-                        if faiss_id_str in self.id_to_chunk:
-                            old_text = self.id_to_chunk[faiss_id_str]
-                            del self.id_to_chunk[faiss_id_str]
-                            if old_text in self.chunk_to_id:
-                                del self.chunk_to_id[old_text]
-
-                # Step 3: 批量生成嵌入向量
+                # Step 2: 批量生成嵌入向量。先准备新向量，成功后再停用旧块。
                 logger.info(f"为 {len(all_new_texts)} 个新文本生成嵌入向量...")
                 embeddings = self.embedding_model.encode(
                     all_new_texts,
@@ -804,16 +855,33 @@ class FaissVectorDB:
                     batch_size=self.config.BATCH_SIZE
                 )
 
-                # Step 4: 批量添加新向量
+                # Step 3: 批量添加新向量
                 logger.info(f"添加 {len(embeddings)} 个新向量到索引...")
-                self.index.add(embeddings)
+                vector_ids = self.metadata_store.add_chunks(all_new_texts) if self.metadata_store else []
+                if not vector_ids:
+                    start_faiss_id = self.index.ntotal
+                    vector_ids = [start_faiss_id + i for i in range(len(all_new_texts))]
+                    for new_text, vector_id in zip(all_new_texts, vector_ids):
+                        self.id_to_chunk[str(vector_id)] = new_text
+                        self.chunk_to_id[new_text] = str(vector_id)
 
-                # Step 5: 更新元数据
-                start_faiss_id = self.index.ntotal - len(all_new_texts)
-                for i, (new_text, update_info) in enumerate(zip(all_new_texts, update_indices)):
-                    faiss_id = start_faiss_id + i
-                    self.id_to_chunk[str(faiss_id)] = new_text
-                    self.chunk_to_id[new_text] = str(faiss_id)
+                try:
+                    self._add_embeddings_with_ids(embeddings, vector_ids)
+                except Exception:
+                    if self.metadata_store and vector_ids:
+                        self.metadata_store.soft_delete_vector_ids(vector_ids)
+                        self._sync_active_metadata_cache()
+                    raise
+
+                # Step 4: 新向量已写入后再软删除旧向量，避免失败时知识丢失。
+                if old_ids_to_deactivate and self.metadata_store:
+                    logger.info(f"软删除 {len(old_ids_to_deactivate)} 个旧向量...")
+                    self.metadata_store.soft_delete_vector_ids(old_ids_to_deactivate)
+                elif old_ids_to_deactivate:
+                    logger.info(f"删除 {len(old_ids_to_deactivate)} 个旧向量...")
+                    self.index.remove_ids(np.array(old_ids_to_deactivate, dtype=np.int64))
+
+                self._sync_active_metadata_cache()
 
                 self.dirty = True
 
@@ -855,12 +923,17 @@ class FaissVectorDB:
                 # 保存FAISS索引
                 faiss.write_index(self.index, temp_index_file)
 
-                # 保存元数据为JSON（替代pickle）
+                self._sync_active_metadata_cache()
+
+                # 保存元数据为JSON（兼容 BM25 和旧部署；主元数据在 SQLite）
                 metadata = {
                     "id_to_chunk": self.id_to_chunk,
                     "chunk_to_id": self.chunk_to_id,
                     "embedding_dim": self.config.EMBEDDING_DIM,
-                    "total_vectors": self.index.ntotal
+                    "total_vectors": self.index.ntotal,
+                    "metadata_backend": "sqlite",
+                    "sqlite_metadata_file": self.sqlite_metadata_file,
+                    "lifecycle_metrics": self.metadata_store.get_metrics() if self.metadata_store else {}
                 }
 
                 with open(temp_metadata_file, 'w', encoding='utf-8') as f:
@@ -896,6 +969,16 @@ class FaissVectorDB:
             self.id_to_chunk = metadata.get("id_to_chunk", {})
             self.chunk_to_id = metadata.get("chunk_to_id", {})
 
+            # 旧 JSON 元数据迁移到 SQLite。IndexIDMap 新索引会直接以 SQLite 为准。
+            if self.metadata_store and self.id_to_chunk:
+                legacy_chunks = [
+                    (int(vector_id), text)
+                    for vector_id, text in self.id_to_chunk.items()
+                    if str(vector_id).lstrip("-").isdigit()
+                ]
+                self.metadata_store.import_active_chunks(legacy_chunks)
+                self._sync_active_metadata_cache()
+
             logger.info(f"成功加载索引，包含 {self.index.ntotal} 个向量")
 
         except FileNotFoundError as e:
@@ -917,7 +1000,8 @@ class FaissVectorDB:
                 "index_type": self.config.INDEX_TYPE,
                 "model_name": self.config.MODEL_NAME,
                 "has_unsaved_changes": self.dirty,
-                "search_optimization_enabled": hasattr(self, 'advanced_search_index')
+                "search_optimization_enabled": hasattr(self, 'advanced_search_index'),
+                "metadata_backend": "sqlite" if self.metadata_store else "json",
             }
 
             # 添加索引特定的状态信息
@@ -935,7 +1019,71 @@ class FaissVectorDB:
             if hasattr(self, 'search_metrics'):
                 stats.update(self.search_metrics.get_summary())
 
+            if self.metadata_store:
+                stats.update(self.metadata_store.get_metrics())
+
             return stats
+
+    def compact_index(self) -> Dict[str, Any]:
+        """Rebuild FAISS index from active SQLite metadata.
+
+        Compaction removes inactive vectors physically. It requires FAISS to
+        reconstruct vectors from the current index, which is available for Flat
+        and many IDMap-backed indexes. If the active index type cannot
+        reconstruct vectors, return a clear error instead of corrupting data.
+        """
+        with self.lock:
+            if not self.metadata_store:
+                raise HTTPException(status_code=500, detail="SQLite 元数据未初始化，无法压缩索引")
+
+            active_chunks = self.metadata_store.get_active_chunks()
+            old_total = self.index.ntotal if self.index else 0
+            if not active_chunks:
+                self.index = self._create_index()
+                self.metadata_store.replace_with_active_chunks([])
+                self._sync_active_metadata_cache()
+                self.dirty = True
+                return {
+                    "message": "索引已压缩为空",
+                    "old_total_vectors": old_total,
+                    "new_total_vectors": 0,
+                    "active_chunks": 0,
+                    "deleted_chunks_removed": old_total,
+                }
+
+            vectors = []
+            new_chunks = []
+            for new_vector_id, chunk in enumerate(active_chunks, start=1):
+                old_vector_id = int(chunk["vector_id"])
+                try:
+                    vector = self.index.reconstruct(old_vector_id)
+                except Exception as e:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "当前 FAISS 索引不支持 reconstruct，无法在线 compaction；"
+                            "请从源文档重新 embedding 后全量重建。"
+                        ),
+                    ) from e
+                vectors.append(vector)
+                new_chunks.append((new_vector_id, chunk["text"]))
+
+            compacted_index = self._create_index()
+            embeddings = np.asarray(vectors, dtype=np.float32)
+            self.index = compacted_index
+            self._add_embeddings_with_ids(embeddings, [vector_id for vector_id, _ in new_chunks])
+            self.metadata_store.replace_with_active_chunks(new_chunks)
+            self._sync_active_metadata_cache()
+            self.dirty = True
+
+            return {
+                "message": "索引压缩完成",
+                "old_total_vectors": old_total,
+                "new_total_vectors": self.index.ntotal,
+                "active_chunks": len(new_chunks),
+                "deleted_chunks_removed": max(old_total - len(new_chunks), 0),
+                "lifecycle_metrics": self.metadata_store.get_metrics(),
+            }
 
     def enable_search_optimization(self):
         """启用搜索优化"""
@@ -1211,6 +1359,11 @@ class UpdateRequest(BaseModel):
     businesstype: Optional[str] = Field(None, description="业务类型标识符", pattern="^[a-zA-Z0-9_-]{1,50}$")
 
 
+class CompactRequest(BaseModel):
+    """索引压缩请求"""
+    businesstype: Optional[str] = Field(None, description="业务类型标识符", pattern="^[a-zA-Z0-9_-]{1,50}$")
+
+
 # ============================================================================
 # MCP 协议模型定义 - JSON-RPC 2.0 格式
 # ============================================================================
@@ -1338,6 +1491,46 @@ def get_mcp_tools() -> List[MCPTool]:
                     }
                 },
                 "required": ["content"]
+            }
+        ),
+        MCPTool(
+            name="update",
+            description="批量更新知识块。使用软删除旧块并追加新向量，适合百万级索引。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "businesstype": {
+                        "type": "string",
+                        "description": "业务类型标识符（可选，默认使用环境变量配置）"
+                    },
+                    "updates": {
+                        "type": "array",
+                        "description": "更新列表，每项包含 old_text 和 new_text",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_text": {"type": "string"},
+                                "new_text": {"type": "string"}
+                            },
+                            "required": ["old_text", "new_text"]
+                        },
+                        "maxItems": 100
+                    }
+                },
+                "required": ["updates"]
+            }
+        ),
+        MCPTool(
+            name="compact",
+            description="压缩索引，物理移除软删除向量。建议 deleted_ratio 超过 0.3 时执行。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "businesstype": {
+                        "type": "string",
+                        "description": "业务类型标识符（可选，默认使用环境变量配置）"
+                    }
+                }
             }
         ),
         MCPTool(
@@ -1484,6 +1677,43 @@ async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, An
                 "total_vectors": vector_db.index.ntotal,
                 "deleted_count": deleted_count
             }
+
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(response, ensure_ascii=False, indent=2)
+                }]
+            }
+
+        elif name == "update":
+            updates = arguments.get("updates", [])
+            if not updates:
+                raise ValueError("updates parameter is required")
+            if len(updates) > 100:
+                raise ValueError("Maximum 100 updates allowed per batch")
+
+            result = vector_db.update_texts(updates)
+            if config.AUTO_SAVE and result["success_count"] > 0:
+                vector_db.save()
+
+            response = {
+                "message": f"更新完成: 成功 {result['success_count']}, 新增 {result['inserted_count']}, 更新 {result['updated_count']}, 失败 {result['failed_count']}",
+                "total_vectors": vector_db.index.ntotal,
+                **result,
+                "lifecycle_metrics": vector_db.metadata_store.get_metrics() if vector_db.metadata_store else {}
+            }
+
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(response, ensure_ascii=False, indent=2)
+                }]
+            }
+
+        elif name == "compact":
+            response = vector_db.compact_index()
+            if config.AUTO_SAVE:
+                vector_db.save()
 
             return {
                 "content": [{
@@ -1730,13 +1960,35 @@ async def update_documents(request: UpdateRequest, background_tasks: BackgroundT
         return {
             "message": f"更新完成: 成功 {result['success_count']}, 新增 {result['inserted_count']}, 更新 {result['updated_count']}, 失败 {result['failed_count']}",
             "total_vectors": vector_db.index.ntotal,
-            **result
+            **result,
+            "lifecycle_metrics": vector_db.metadata_store.get_metrics() if vector_db.metadata_store else {}
         }
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"更新文档失败: {e}")
+        raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+
+@app.post("/compact", summary="压缩索引", tags=["传统API"])
+async def compact_index(request: CompactRequest, background_tasks: BackgroundTasks):
+    """压缩索引，物理移除软删除向量"""
+    try:
+        if not vector_db_manager:
+            raise HTTPException(status_code=503, detail="向量数据库管理器未初始化")
+
+        vector_db = vector_db_manager.get_instance(request.businesstype)
+        result = vector_db.compact_index()
+
+        if config.AUTO_SAVE:
+            background_tasks.add_task(vector_db.save)
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"压缩索引失败: {e}")
         raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
 
 @app.post("/search", summary="搜索知识", tags=["传统API"])

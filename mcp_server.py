@@ -192,6 +192,50 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="update_document",
+            description=f"""批量更新知识库内容。旧内容会软删除，新内容会追加为稳定 vector_id，适合百万级索引。
+
+默认业务类型: {default_bt}""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "updates": {
+                        "type": "array",
+                        "description": "更新列表，每项包含 old_text 和 new_text",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_text": {"type": "string"},
+                                "new_text": {"type": "string"}
+                            },
+                            "required": ["old_text", "new_text"]
+                        },
+                        "maxItems": 100
+                    },
+                    "businesstype": {
+                        "type": "string",
+                        "description": "业务类型标识符（可选，默认使用环境变量配置）"
+                    }
+                },
+                "required": ["updates"]
+            }
+        ),
+        Tool(
+            name="compact_index",
+            description=f"""压缩索引，物理移除软删除向量。建议 deleted_ratio 超过 0.3 时执行。
+
+默认业务类型: {default_bt}""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "businesstype": {
+                        "type": "string",
+                        "description": "业务类型标识符（可选，默认使用环境变量配置）"
+                    }
+                }
+            }
+        ),
+        Tool(
             name="get_stats",
             description=f"""获取向量数据库的统计信息，包括向量数量、索引类型、优化状态等。
 
@@ -369,6 +413,41 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent | ImageCo
                 "deleted_count": deleted_count
             }
             
+            return [TextContent(
+                type="text",
+                text=json.dumps(response, ensure_ascii=False, indent=2)
+            )]
+
+        elif name == "update_document":
+            updates = arguments.get("updates", [])
+            if not updates:
+                raise ValueError("updates parameter is required")
+            if len(updates) > 100:
+                raise ValueError("Maximum 100 updates allowed per batch")
+
+            result = vector_db.update_texts(updates)
+
+            if config.AUTO_SAVE and result["success_count"] > 0:
+                vector_db.save()
+
+            response = {
+                "message": f"更新完成: 成功 {result['success_count']}, 新增 {result['inserted_count']}, 更新 {result['updated_count']}, 失败 {result['failed_count']}",
+                "total_vectors": vector_db.index.ntotal,
+                **result,
+                "lifecycle_metrics": vector_db.metadata_store.get_metrics() if vector_db.metadata_store else {}
+            }
+
+            return [TextContent(
+                type="text",
+                text=json.dumps(response, ensure_ascii=False, indent=2)
+            )]
+
+        elif name == "compact_index":
+            response = vector_db.compact_index()
+
+            if config.AUTO_SAVE:
+                vector_db.save()
+
             return [TextContent(
                 type="text",
                 text=json.dumps(response, ensure_ascii=False, indent=2)

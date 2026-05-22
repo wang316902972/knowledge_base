@@ -189,6 +189,37 @@ def get_mcp_tools() -> List[MCPTool]:
             }
         ),
         MCPTool(
+            name="update_document",
+            description="批量更新知识库内容。旧内容软删除，新内容追加为稳定 vector_id，适合百万级索引。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "updates": {
+                        "type": "array",
+                        "description": "更新列表，每项包含 old_text 和 new_text",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_text": {"type": "string"},
+                                "new_text": {"type": "string"}
+                            },
+                            "required": ["old_text", "new_text"]
+                        },
+                        "maxItems": 100
+                    }
+                },
+                "required": ["updates"]
+            }
+        ),
+        MCPTool(
+            name="compact_index",
+            description="压缩索引，物理移除软删除向量。建议 deleted_ratio 超过 0.3 时执行。",
+            inputSchema={
+                "type": "object",
+                "properties": {}
+            }
+        ),
+        MCPTool(
             name="get_stats",
             description="获取向量数据库的统计信息，包括向量数量、索引类型、优化状态等。",
             inputSchema={
@@ -389,7 +420,48 @@ async def execute_tool(name: str, arguments: Dict[str, Any]) -> MCPCallToolRespo
                     text=json.dumps(response, ensure_ascii=False, indent=2)
                 )]
             )
-        
+
+        elif name == "update_document":
+            updates = arguments.get("updates", [])
+
+            if not updates:
+                raise ValueError("updates parameter is required")
+
+            if len(updates) > 100:
+                raise ValueError("Maximum 100 updates allowed per batch")
+
+            result = vector_db.update_texts(updates)
+
+            if config.AUTO_SAVE and result["success_count"] > 0:
+                vector_db.save()
+
+            response = {
+                "message": f"更新完成: 成功 {result['success_count']}, 新增 {result['inserted_count']}, 更新 {result['updated_count']}, 失败 {result['failed_count']}",
+                "total_vectors": vector_db.index.ntotal,
+                **result,
+                "lifecycle_metrics": vector_db.metadata_store.get_metrics() if vector_db.metadata_store else {}
+            }
+
+            return MCPCallToolResponse(
+                content=[MCPContent(
+                    type="text",
+                    text=json.dumps(response, ensure_ascii=False, indent=2)
+                )]
+            )
+
+        elif name == "compact_index":
+            response = vector_db.compact_index()
+
+            if config.AUTO_SAVE:
+                vector_db.save()
+
+            return MCPCallToolResponse(
+                content=[MCPContent(
+                    type="text",
+                    text=json.dumps(response, ensure_ascii=False, indent=2)
+                )]
+            )
+
         elif name == "get_stats":
             # 获取统计信息
             stats = vector_db.get_stats()
@@ -539,6 +611,28 @@ async def add_endpoint(content: str, chunk_size: int = 500, chunk_overlap: int =
     return json.loads(response.content[0].text)
 
 
+@app.post("/update")
+async def update_endpoint(updates: List[Dict[str, str]]):
+    """更新文档端点（REST API 风格）"""
+    response = await execute_tool("update_document", {"updates": updates})
+
+    if response.isError:
+        raise HTTPException(status_code=500, detail=json.loads(response.content[0].text))
+
+    return json.loads(response.content[0].text)
+
+
+@app.post("/compact")
+async def compact_endpoint():
+    """压缩索引端点（REST API 风格）"""
+    response = await execute_tool("compact_index", {})
+
+    if response.isError:
+        raise HTTPException(status_code=500, detail=json.loads(response.content[0].text))
+
+    return json.loads(response.content[0].text)
+
+
 @app.get("/stats")
 async def stats_endpoint():
     """统计信息端点（REST API 风格）"""
@@ -561,7 +655,7 @@ async def startup_event():
     """应用启动时初始化"""
     global vector_db
     logger.info("正在初始化 FAISS Vector Database MCP HTTP Server...")
-    logger.info(f"业务ID: {config.BUSINESS_ID}")
+    logger.info(f"业务类型: {config.DEFAULT_BUSINESSTYPE}")
     logger.info(f"索引类型: {config.INDEX_TYPE}")
     logger.info(f"模型: {config.MODEL_NAME}")
     vector_db = FaissVectorDB(config)

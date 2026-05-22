@@ -309,11 +309,13 @@ class ProductionConfig(Config):
         >>> config.validate()
     """
 
-    INDEX_TYPE: Literal["FlatIP", "FlatL2", "IVFFlat", "HNSW"] = "HNSW"  # type: ignore[assignment]
-    AUTO_SAVE: bool = True
-    LOG_LEVEL: str = "WARNING"
-    BATCH_SIZE: int = 64
-    USE_GPU: bool = True
+    INDEX_TYPE: Literal["FlatIP", "FlatL2", "IVFFlat", "HNSW"] = os.getenv(
+        "FAISS_INDEX_TYPE", "HNSW"
+    )  # type: ignore[assignment]
+    AUTO_SAVE: bool = os.getenv("AUTO_SAVE", "true").lower() == "true"
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "WARNING")
+    BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "64"))
+    USE_GPU: bool = os.getenv("USE_GPU", "true").lower() == "true"
     ENABLE_SEARCH_OPTIMIZATION: bool = True
     SEMANTIC_CHUNKING: bool = True
     RELEVANCE_THRESHOLD: float = 0.6

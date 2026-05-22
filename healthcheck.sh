@@ -9,15 +9,16 @@ PORT=${API_PORT:-8001}
 
 # 执行健康检查
 python3 -c "
-import requests
 import sys
 import os
+from urllib.request import urlopen
 
 try:
     port = os.environ.get('API_PORT', '8001')
     url = f'http://localhost:{port}/health'
-    response = requests.get(url, timeout=5)
-    response.raise_for_status()
+    with urlopen(url, timeout=5) as response:
+        if response.status >= 400:
+            raise RuntimeError(f'HTTP {response.status}')
     print('Health check passed')
     sys.exit(0)
 except Exception as e:

@@ -4,8 +4,8 @@ FROM python:3.11-slim
 # 设置工作目录
 WORKDIR /app
 
-ENV http_proxy=http://192.168.136.223:7897
-ENV https_proxy=http://192.168.136.223:7897
+ARG http_proxy
+ARG https_proxy
 
 # 设置环境变量
 ENV PYTHONDONTWRITEBYTECODE=1 \
