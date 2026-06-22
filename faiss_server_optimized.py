@@ -14,6 +14,8 @@ Example:
 import faiss
 import json
 import os
+import math
+import re
 import threading
 import time
 import asyncio
@@ -60,6 +62,79 @@ if not os.environ.get('HF_ENDPOINT'):
 os.environ['HF_HOME'] = '/root/.cache/huggingface'
 os.environ['HUGGINGFACE_HUB_CACHE'] = '/root/.cache/huggingface/hub'
 logger.info(f"设置 HuggingFace 缓存路径: {os.environ['HF_HOME']}")
+
+
+TOKEN_PATTERN = re.compile(r"[\u4e00-\u9fff]{2,}|[a-zA-Z][a-zA-Z0-9_-]+|\d+")
+SENSITIVE_PATH_PATTERN = re.compile(
+    r"(?im)^obsidian path:\s*(账号配置|account|credential|secret|password|token|key)(/|\\|$)"
+)
+MIN_LEXICAL_OVERLAP_FOR_RESULTS = 0.3
+SENSITIVE_BUSINESSTYPES = {"account_config"}
+ACCESS_KEY_ENV = "ACCOUNT_CONFIG_ACCESS_KEY"
+ACCESS_KEY_FILENAME = ".access_key"
+
+
+def _search_tokens(text: str) -> List[str]:
+    """Tokenize text for lightweight lexical relevance checks."""
+    tokens: List[str] = []
+    for token in TOKEN_PATTERN.findall(text or ""):
+        token = token.lower()
+        if re.fullmatch(r"[\u4e00-\u9fff]{2,}", token):
+            tokens.append(token)
+            tokens.extend(token[i:i + 2] for i in range(len(token) - 1))
+        else:
+            tokens.append(token)
+    return tokens
+
+
+def _lexical_overlap_score(query: str, text: str) -> float:
+    query_tokens = {token for token in _search_tokens(query) if len(token) > 1 or "\u4e00" <= token <= "\u9fff"}
+    if not query_tokens:
+        return 0.0
+
+    text_lower = (text or "").lower()
+    matches = sum(1 for token in query_tokens if token in text_lower)
+    return matches / len(query_tokens)
+
+
+def _looks_like_high_entropy_secret(text: str, allow_sensitive_path: bool = False) -> bool:
+    """Detect encrypted/base64-like blobs that are poor search results."""
+    if not text:
+        return False
+
+    if not allow_sensitive_path and SENSITIVE_PATH_PATTERN.search(text):
+        return True
+
+    compact_lines = [
+        line.strip()
+        for line in text.splitlines()
+        if len(line.strip()) >= 120
+    ]
+    if not compact_lines:
+        return False
+
+    for line in compact_lines:
+        chars = re.sub(r"\s+", "", line)
+        if len(chars) < 120:
+            continue
+
+        alpha_numeric_symbol = sum(
+            1 for char in chars if char.isascii() and (char.isalnum() or char in "+/=_-")
+        )
+        ascii_ratio = alpha_numeric_symbol / len(chars)
+        if ascii_ratio < 0.92:
+            continue
+
+        chinese_count = len(re.findall(r"[\u4e00-\u9fff]", line))
+        if chinese_count > 0:
+            continue
+
+        unique_ratio = len(set(chars)) / len(chars)
+        has_secret_markers = any(marker in text.lower() for marker in ("密文", "解密", "secret", "token", "password"))
+        if unique_ratio > 0.18 or has_secret_markers:
+            return True
+
+    return False
 
 
 # 线程安全的向量数据库类
@@ -208,6 +283,26 @@ class FaissVectorDB:
         if self.metadata_store:
             return self.metadata_store.get_text(vector_id)
         return self.id_to_chunk.get(str(vector_id))
+
+    def _is_searchable_text(self, text: Optional[str]) -> bool:
+        allow_sensitive_path = self.businesstype == "account_config"
+        return bool(text and not _looks_like_high_entropy_secret(text, allow_sensitive_path=allow_sensitive_path))
+
+    def _index_metric_kind(self) -> str:
+        configured = str(getattr(self.config, "INDEX_TYPE", "FlatIP")).lower()
+        if configured in {"flatl2", "ivfflat", "hnsw"}:
+            return "distance"
+        return "similarity"
+
+    def _normalize_vector_relevance(self, raw_score: float) -> float:
+        if not math.isfinite(raw_score):
+            return 0.0
+
+        if self._index_metric_kind() == "similarity":
+            return max(0.0, min(1.0, raw_score))
+
+        # Embeddings are normalized. For squared L2 distance, cosine ~= 1 - d/2.
+        return max(0.0, min(1.0, 1.0 - (raw_score / 2.0)))
     
     def _create_or_load_index(self):
         """创建或加载索引"""
@@ -416,17 +511,12 @@ class FaissVectorDB:
                 if not (score == float('inf') or score == float('-inf') or score != score):  # 检查 inf, -inf, nan
                     # 基本的文本相关性检查：确保查询词在结果中
                     text = self._get_text_for_vector_id(int(idx))
-                    if text is None:
+                    if not self._is_searchable_text(text):
                         continue
-                    query_terms = set(query.lower().split())
-                    text_lower = text.lower()
-
-                    # 计算简单的文本匹配分数
-                    term_matches = sum(1 for term in query_terms if term in text_lower)
-                    text_relevance = term_matches / max(len(query_terms), 1)
+                    text_relevance = _lexical_overlap_score(query, text)
 
                     # 只有当有一定文本相关性时才添加结果
-                    if text_relevance > 0.1:  # 至少有一些词匹配
+                    if text_relevance >= MIN_LEXICAL_OVERLAP_FOR_RESULTS:
                         results.append({
                             "text": text,
                             "score": score,
@@ -533,15 +623,25 @@ class FaissVectorDB:
                             strategies_used=['exact']
                         )
 
-            # Step 3.5: Apply BM25 keyword search as fallback (if enabled and still few results)
+            # Step 3.5: Apply BM25 keyword search as fallback (if enabled and still few lexical hits)
+            lexical_hit_count = sum(
+                1 for result in all_results.values()
+                if _lexical_overlap_score(query, result.text) > 0
+            )
             if (coordinator.is_bm25_available() and
                 self.config.ENABLE_BM25_FALLBACK and
-                len(all_results) < top_k):
+                (len(all_results) < top_k or lexical_hit_count < min(top_k, 3))):
 
-                logger.info(f"Applying BM25 fallback search (current results: {len(all_results)})")
+                logger.info(
+                    "Applying BM25 fallback search "
+                    f"(current results: {len(all_results)}, lexical hits: {lexical_hit_count})"
+                )
                 bm25_results = coordinator.search_bm25(query, top_k)
 
                 for result in bm25_results:
+                    if not self._is_searchable_text(result.text):
+                        continue
+
                     # Use chunk_id as key for BM25 results
                     result_key = f"chunk_{result.chunk_id}"
 
@@ -567,6 +667,12 @@ class FaissVectorDB:
                 logger.info("Enhanced search found no results")
                 return []
 
+            lexical_scores = {
+                id(result): _lexical_overlap_score(query, result.text)
+                for result in results_list
+            }
+            has_lexical_candidates = any(score > 0 for score in lexical_scores.values())
+
             # Step 4: Calculate adaptive threshold
             relevance_scores = [r.relevance_score for r in results_list]
             threshold, adjustments = coordinator.calculate_adaptive_threshold(
@@ -580,19 +686,35 @@ class FaissVectorDB:
             # Step 5: Filter results
             filtered_results = [r for r in results_list if r.relevance_score >= threshold]
 
+            # Keep lexical hits for technical/document queries. Pure vector hits with
+            # zero lexical overlap are often encrypted blobs or unrelated notes in a
+            # small mixed-purpose knowledge base.
+            if has_lexical_candidates:
+                filtered_results = [
+                    r for r in filtered_results
+                    if (
+                        lexical_scores.get(id(r), 0.0) >= MIN_LEXICAL_OVERLAP_FOR_RESULTS
+                        or "exact" in r.strategies_used
+                        or "bm25" in r.strategies_used
+                    )
+                ]
+
             # If still too few results, relax threshold
-            if len(filtered_results) < min(top_k, 3):
+            if len(filtered_results) < min(top_k, 3) and not has_lexical_candidates:
                 relaxed_threshold = max(self.config.MIN_RELEVANCE_THRESHOLD, threshold * 0.5)
                 filtered_results = [r for r in results_list if r.relevance_score >= relaxed_threshold]
                 logger.info(f"Relaxed threshold to {relaxed_threshold:.3f}, got {len(filtered_results)} results")
 
             # If still no results, return all sorted by relevance
-            if len(filtered_results) == 0:
+            if len(filtered_results) == 0 and not has_lexical_candidates:
                 filtered_results = sorted(results_list, key=lambda x: x.relevance_score, reverse=True)
                 logger.warning("No results passed threshold, returning all results sorted by relevance")
 
             # Sort by relevance score
-            filtered_results.sort(key=lambda x: x.relevance_score, reverse=True)
+            filtered_results.sort(
+                key=lambda x: (lexical_scores.get(id(x), 0.0), x.relevance_score),
+                reverse=True,
+            )
 
             # Step 6: Calculate quality metrics
             quality_metrics = coordinator.calculate_quality_metrics(
@@ -609,6 +731,7 @@ class FaissVectorDB:
                     "faiss_id": int(result.faiss_id),
                     "match_type": result.match_type,
                     "strategies_used": result.strategies_used,
+                    "lexical_score": float(lexical_scores.get(id(result), 0.0)),
                     "search_method": "enhanced"
                 }
 
@@ -668,18 +791,18 @@ class FaissVectorDB:
                 score = float(dist)
                 if not (score == float('inf') or score == float('-inf') or score != score):
                     text = self._get_text_for_vector_id(int(idx))
-                    if text is None:
+                    if not self._is_searchable_text(text):
                         continue
 
-                    # Calculate relevance score (cosine similarity)
-                    # For normalized vectors, FAISS distance ≈ 1 - cosine_similarity
-                    relevance_score = max(0.0, 1.0 - score)
+                    relevance_score = self._normalize_vector_relevance(score)
+                    lexical_score = _lexical_overlap_score(query, text)
 
                     results.append({
                         "text": text,
                         "score": score,
                         "similarity_score": score,
                         "relevance_score": relevance_score,
+                        "lexical_score": lexical_score,
                         "faiss_id": int(idx)
                     })
 
@@ -695,6 +818,8 @@ class FaissVectorDB:
         for faiss_id_str, text in self.id_to_chunk.items():
             faiss_id = int(faiss_id_str)
             text_lower = text.lower()
+            if not self._is_searchable_text(text):
+                continue
 
             # Check for exact match in text
             if query_lower in text_lower:
@@ -1284,6 +1409,44 @@ class VectorDBManager:
 config = get_config()
 vector_db_manager = None
 
+
+def _is_sensitive_businesstype(businesstype: Optional[str]) -> bool:
+    resolved = config._validate_businesstype(businesstype or config.DEFAULT_BUSINESSTYPE)
+    return resolved in SENSITIVE_BUSINESSTYPES
+
+
+def _get_sensitive_access_key(businesstype: str) -> Optional[str]:
+    env_key = os.getenv(ACCESS_KEY_ENV)
+    if env_key:
+        return env_key.strip()
+
+    key_file = Path(config.DATA_DIR) / businesstype / ACCESS_KEY_FILENAME
+    try:
+        if key_file.exists():
+            return key_file.read_text(encoding="utf-8").strip()
+    except OSError as e:
+        logger.error(f"读取敏感知识库访问密钥失败: {e}")
+
+    return None
+
+
+def _validate_sensitive_access(businesstype: Optional[str], access_key: Optional[str]) -> Optional[Dict[str, Any]]:
+    resolved = config._validate_businesstype(businesstype or config.DEFAULT_BUSINESSTYPE)
+    if resolved not in SENSITIVE_BUSINESSTYPES:
+        return None
+
+    expected_key = _get_sensitive_access_key(resolved)
+    if expected_key and access_key == expected_key:
+        return None
+
+    return {
+        "relevant_chunks": [],
+        "detailed_results": [],
+        "total_found": 0,
+        "access_granted": False,
+        "message": "账号配置知识库包含敏感信息，请提供正确的 access_key 后重试",
+    }
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
@@ -1338,6 +1501,7 @@ class Query(BaseModel):
     businesstype: Optional[str] = Field(None, description="业务类型标识符", pattern="^[a-zA-Z0-9_-]{1,50}$")
     top_k: int = Field(default=3, description="返回结果数量", ge=1, le=50)
     use_optimization: bool = Field(default=True, description="是否使用搜索优化")
+    access_key: Optional[str] = Field(None, description="敏感知识库访问密钥", max_length=200)
 
 class BenchmarkQueries(BaseModel):
     queries: List[str] = Field(..., description="测试查询列表", max_length=20)
@@ -1424,6 +1588,10 @@ def get_mcp_tools() -> List[MCPTool]:
                         "default": 5,
                         "minimum": 1,
                         "maximum": 50
+                    },
+                    "access_key": {
+                        "type": "string",
+                        "description": "敏感知识库访问密钥（查询 account_config 时必填）"
                     }
                 },
                 "required": ["query"]
@@ -1573,9 +1741,20 @@ async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, An
             # 搜索知识
             query = arguments.get("query")
             top_k = arguments.get("top_k", 5)
+            access_key = arguments.get("access_key")
 
             if not query:
                 raise ValueError("query parameter is required")
+
+            access_error = _validate_sensitive_access(businesstype, access_key)
+            if access_error is not None:
+                access_error["query"] = query
+                return {
+                    "content": [{
+                        "type": "text",
+                        "text": json.dumps(access_error, ensure_ascii=False, indent=2)
+                    }]
+                }
 
             if vector_db.index.ntotal == 0:
                 return {
@@ -1998,6 +2177,15 @@ async def search_knowledge(query: Query):
         if not vector_db_manager:
             raise HTTPException(status_code=503, detail="向量数据库管理器未初始化")
 
+        access_error = _validate_sensitive_access(query.businesstype, query.access_key)
+        if access_error is not None:
+            access_error.update({
+                "query": query.question,
+                "search_method": "access_control",
+                "optimization_enabled": query.use_optimization,
+            })
+            return access_error
+
         # 获取适当的数据库实例
         vector_db = vector_db_manager.get_instance(query.businesstype)
 
@@ -2014,6 +2202,7 @@ async def search_knowledge(query: Query):
             "detailed_results": results,
             "query": query.question,
             "total_found": len(results),
+            "access_granted": True,
             "search_method": search_method,
             "optimization_enabled": query.use_optimization
         }
