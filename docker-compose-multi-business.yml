@@ -3,8 +3,8 @@ services:
   # 默认业务实例
   faiss-default:
     build: .
-    ports:
-      - "8003:8001"
+    expose:
+      - "8001"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -23,6 +23,7 @@ services:
     restart: unless-stopped
     networks:
       - faiss-network
+      - mcp_network
     # Use host network for better internet access (optional)
     # network_mode: host
 
@@ -76,6 +77,9 @@ services:
 networks:
   faiss-network:
     driver: bridge
+  mcp_network:
+    external: true
+    name: mcp_network
 
 volumes:
   faiss-data:
