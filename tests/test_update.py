@@ -32,8 +32,11 @@ def mock_config():
 
 
 @pytest.fixture
-def mock_db(mock_config):
+def mock_db(mock_config, tmp_path):
     """Mock FaissVectorDB 实例"""
+    mock_config.DATA_DIR = str(tmp_path)
+    mock_config.get_index_file = lambda bt: str(tmp_path / bt / f"{bt}_knowledge_base.index")
+    mock_config.get_metadata_file = lambda bt: str(tmp_path / bt / f"{bt}_knowledge_base.json")
     with patch('faiss_server_optimized.SentenceTransformer') as mock_model, \
          patch('faiss_server_optimized.faiss') as mock_faiss:
 
@@ -60,15 +63,20 @@ def mock_db(mock_config):
         yield db
 
 
+def seed_chunks(db, texts):
+    chunks = [(index + 1, text) for index, text in enumerate(texts)]
+    db.metadata_store.add_chunks_with_ids(chunks)
+    db._sync_active_metadata_cache()
+    db.index.ntotal = len(chunks)
+
+
 class TestUpdateTexts:
     """测试 update_texts 方法"""
 
     def test_update_single_existing_text(self, mock_db):
         """测试更新已存在的文本"""
         # 先添加一个文本
-        mock_db.id_to_chunk = {"0": "原始内容"}
-        mock_db.chunk_to_id = {"原始内容": "0"}
-        mock_db.index.ntotal = 1
+        seed_chunks(mock_db, ["原始内容"])
 
         # Mock 嵌入生成
         mock_db.embedding_model.encode.return_value = np.random.rand(1, 384).astype(np.float32)
@@ -89,9 +97,9 @@ class TestUpdateTexts:
         assert "原始内容" not in mock_db.chunk_to_id
         assert "更新后的内容" in mock_db.chunk_to_id
 
-        # 验证 FAISS 操作被调用
-        mock_db.index.remove_ids.assert_called_once()
-        mock_db.index.add.assert_called_once()
+        # 软删除不修改旧 FAISS 向量，新内容使用稳定 ID 追加。
+        mock_db.index.remove_ids.assert_not_called()
+        mock_db.index.add_with_ids.assert_called_once()
 
     def test_upsert_non_existing_text(self, mock_db):
         """测试 upsert 语义：不存在的文本则插入"""
@@ -112,15 +120,13 @@ class TestUpdateTexts:
         # 验证新文本被添加
         assert "新内容" in mock_db.chunk_to_id
 
-        # 验证只调用了 add，没有调用 remove_ids
+        # 验证只追加稳定 ID，没有物理删除
         mock_db.index.remove_ids.assert_not_called()
-        mock_db.index.add.assert_called_once()
+        mock_db.index.add_with_ids.assert_called_once()
 
     def test_update_same_text_skips(self, mock_db):
         """测试 old_text == new_text 时跳过"""
-        mock_db.id_to_chunk = {"0": "相同文本"}
-        mock_db.chunk_to_id = {"相同文本": "0"}
-        mock_db.index.ntotal = 1
+        seed_chunks(mock_db, ["相同文本"])
 
         # 执行更新
         result = mock_db.update_texts([
@@ -134,14 +140,12 @@ class TestUpdateTexts:
 
         # 验证没有调用 FAISS 操作
         mock_db.index.remove_ids.assert_not_called()
-        mock_db.index.add.assert_not_called()
+        mock_db.index.add_with_ids.assert_not_called()
 
     def test_batch_update_mixed_operations(self, mock_db):
         """测试批量更新：混合更新和新增操作"""
         # 设置初始状态
-        mock_db.id_to_chunk = {"0": "文本1", "1": "文本2"}
-        mock_db.chunk_to_id = {"文本1": "0", "文本2": "1"}
-        mock_db.index.ntotal = 2
+        seed_chunks(mock_db, ["文本1", "文本2"])
 
         # Mock 嵌入生成（3个新文本）
         mock_db.embedding_model.encode.return_value = np.random.rand(3, 384).astype(np.float32)
@@ -178,9 +182,7 @@ class TestUpdateTexts:
 
     def test_batch_update_partial_failure(self, mock_db):
         """测试批量更新部分失败"""
-        mock_db.id_to_chunk = {"0": "存在的文本"}
-        mock_db.chunk_to_id = {"存在的文本": "0"}
-        mock_db.index.ntotal = 1
+        seed_chunks(mock_db, ["存在的文本"])
 
         # Mock 嵌入生成（只生成有效的）
         mock_db.embedding_model.encode.return_value = np.random.rand(1, 384).astype(np.float32)
@@ -247,13 +249,11 @@ class TestEdgeCases:
 
         # 验证没有调用 FAISS 操作
         mock_db.index.remove_ids.assert_not_called()
-        mock_db.index.add.assert_not_called()
+        mock_db.index.add_with_ids.assert_not_called()
 
     def test_update_duplicate_old_texts(self, mock_db):
         """测试重复的 old_text 出现多次"""
-        mock_db.id_to_chunk = {"0": "重复文本"}
-        mock_db.chunk_to_id = {"重复文本": "0"}
-        mock_db.index.ntotal = 1
+        seed_chunks(mock_db, ["重复文本"])
 
         mock_db.embedding_model.encode.return_value = np.random.rand(2, 384).astype(np.float32)
 
@@ -263,5 +263,5 @@ class TestEdgeCases:
             {"old_text": "重复文本", "new_text": "更新2"},
         ])
 
-        # 两次都应该成功（第一次删除，第二次当作新增）
+        # 查找阶段都命中同一旧文本，两条新内容均以稳定 ID 追加。
         assert result["success_count"] == 2

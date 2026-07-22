@@ -12,6 +12,7 @@ Example:
     >>> results = await db.search("查询文本", top_k=5)
 """
 import faiss
+import hashlib
 import json
 import os
 import math
@@ -19,6 +20,7 @@ import re
 import threading
 import time
 import asyncio
+import unicodedata
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Sequence, Union
 from contextlib import asynccontextmanager
@@ -72,6 +74,15 @@ MIN_LEXICAL_OVERLAP_FOR_RESULTS = 0.3
 SENSITIVE_BUSINESSTYPES = {"account_config"}
 ACCESS_KEY_ENV = "ACCOUNT_CONFIG_ACCESS_KEY"
 ACCESS_KEY_FILENAME = ".access_key"
+SQL_TEMPLATE_SLOT_PATTERN = re.compile(r":([A-Za-z_][A-Za-z0-9_]*)")
+SQL_TEMPLATE_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
+SQL_TEMPLATE_SLOT_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+SQL_TEMPLATE_STATUSES = {"pending_review", "active", "disabled", "stale"}
+SQL_TEMPLATE_SLOT_TYPES = {"string", "uint64", "date", "enum", "integer"}
+
+
+class IndexMetadataConsistencyError(RuntimeError):
+    """Raised when active SQLite chunks are absent from the FAISS index."""
 
 
 def _search_tokens(text: str) -> List[str]:
@@ -149,6 +160,14 @@ class FaissVectorDB:
         self.id_to_chunk: Dict[str, str] = {}
         self.chunk_to_id: Dict[str, str] = {}  # 反向索引用于精确删除
         self.dirty = False  # 标记是否有未保存的更改
+        self.hybrid_search_metrics = {
+            "search_count": 0,
+            "fallback_count": 0,
+            "total_latency_ms": 0.0,
+            "last_latency_ms": 0.0,
+            "last_strategy_counts": {},
+            "strategy_hit_totals": {"vector": 0, "bm25": 0, "exact": 0},
+        }
 
         # 业务类型特定的路径
         self.index_file = config.get_index_file(self.businesstype)
@@ -267,6 +286,73 @@ class FaissVectorDB:
         self.id_to_chunk = self.metadata_store.get_active_text_map()
         self.chunk_to_id = self.metadata_store.get_chunk_to_id_map()
 
+    def _record_hybrid_search(
+        self,
+        started_at: float,
+        strategy_counts: Optional[Dict[str, int]] = None,
+        fallback: bool = False,
+    ) -> None:
+        latency_ms = (time.perf_counter() - started_at) * 1000
+        metrics = self.hybrid_search_metrics
+        metrics["search_count"] += 1
+        metrics["fallback_count"] += int(fallback)
+        metrics["total_latency_ms"] += latency_ms
+        metrics["last_latency_ms"] = latency_ms
+        if strategy_counts is not None:
+            metrics["last_strategy_counts"] = dict(strategy_counts)
+            for strategy, count in strategy_counts.items():
+                metrics["strategy_hit_totals"][strategy] = (
+                    metrics["strategy_hit_totals"].get(strategy, 0) + int(count)
+                )
+
+    def _get_index_vector_ids(self) -> set[int]:
+        """Return external vector IDs stored in FAISS."""
+        if self.index is None:
+            return set()
+
+        total = int(getattr(self.index, "ntotal", 0))
+        id_map = getattr(self.index, "id_map", None)
+        if id_map is not None:
+            try:
+                vector_ids = np.asarray(faiss.vector_to_array(id_map), dtype=np.int64)
+                if vector_ids.size == total:
+                    return {int(vector_id) for vector_id in vector_ids.tolist()}
+            except Exception as exc:
+                logger.warning(f"读取 FAISS IDMap 失败，按顺序 ID 校验: {exc}")
+
+        return set(range(total))
+
+    def _get_index_consistency(self) -> Dict[str, Any]:
+        """Compare active SQLite IDs with the IDs addressable in FAISS."""
+        if not self.metadata_store:
+            return {
+                "consistent": True,
+                "checked": False,
+                "missing_active_count": 0,
+            }
+
+        faiss_ids = self._get_index_vector_ids()
+        active_ids = set(self.metadata_store.get_active_vector_ids())
+        missing_active_ids = sorted(active_ids - faiss_ids)
+        return {
+            "consistent": not missing_active_ids,
+            "checked": True,
+            "faiss_id_count": len(faiss_ids),
+            "active_metadata_id_count": len(active_ids),
+            "missing_active_count": len(missing_active_ids),
+            "missing_active_ids": missing_active_ids[:20],
+        }
+
+    def _validate_index_metadata_consistency(self) -> Dict[str, Any]:
+        consistency = self._get_index_consistency()
+        if not consistency["consistent"]:
+            raise IndexMetadataConsistencyError(
+                "SQLite 活动元数据包含 FAISS 中不存在的向量 ID: "
+                f"count={consistency['missing_active_count']}, "
+                f"sample={consistency['missing_active_ids']}"
+            )
+        return consistency
+
     def _add_embeddings_with_ids(self, embeddings, vector_ids: List[int]) -> None:
         id_array = np.array(vector_ids, dtype=np.int64)
         if self._supports_stable_vector_ids():
@@ -308,8 +394,19 @@ class FaissVectorDB:
         """创建或加载索引"""
         try:
             self.load()
-        except (FileNotFoundError, json.JSONDecodeError, RuntimeError) as e:
-            logger.info(f"未找到现有索引或加载失败: {e}，创建新索引...")
+        except FileNotFoundError as e:
+            active_ids = (
+                self.metadata_store.get_active_vector_ids()
+                if self.metadata_store
+                else []
+            )
+            if active_ids:
+                raise IndexMetadataConsistencyError(
+                    "FAISS 索引文件缺失，但 SQLite 仍有活动元数据；"
+                    "拒绝创建空索引以避免静默丢失"
+                ) from e
+
+            logger.info(f"未找到现有索引: {e}，创建新索引...")
             self.index = self._create_index()
             self.id_to_chunk = {}
             self.chunk_to_id = {}
@@ -532,38 +629,35 @@ class FaissVectorDB:
         return results[:top_k]
 
     def enhanced_search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """
-        Enhanced search with adaptive thresholding, query expansion, and hybrid retrieval
-
-        Args:
-            query: Search query text
-            top_k: Number of results to return
-
-        Returns:
-            List of search results with enhanced metadata
-        """
+        """Search with vector, BM25, exact match, and weighted RRF fusion."""
+        started_at = time.perf_counter()
         try:
-            # Initialize enhancement coordinator if not already initialized
             if not hasattr(self, 'enhancement_coordinator'):
                 self.enhancement_coordinator = RetrievalEnhancementCoordinator(
-                    self.config, self.embedding_model, self.businesstype
+                    self.config,
+                    self.embedding_model,
+                    self.businesstype,
+                    documents_provider=(
+                        self.metadata_store.get_active_text_map
+                        if self.metadata_store
+                        else None
+                    ),
+                    revision_provider=(
+                        self.metadata_store.get_chunks_revision
+                        if self.metadata_store
+                        else None
+                    ),
                 )
 
             coordinator = self.enhancement_coordinator
-
-            # Step 1: Enhance query
             enhanced_query = coordinator.enhance_query(query)
-            logger.info(f"Query enhanced: {len(enhanced_query.expanded_variants)} variants, "
-                       f"domain terms: {enhanced_query.domain_terms}")
+            hybrid_enabled = bool(self.config.ENABLE_HYBRID_RETRIEVAL)
+            candidate_k = max(top_k * 3, top_k)
 
-            # Step 2: Execute vector search with expanded queries
-            all_results = {}  # faiss_id -> SearchResult
-
-            # Search with original query
-            vector_results = self._execute_vector_search(query, top_k * 3)
-            for result_dict in vector_results:
-                faiss_id = result_dict['faiss_id']
-                all_results[faiss_id] = SearchResult(
+            vector_by_id: Dict[int, SearchResult] = {}
+            for result_dict in self._execute_vector_search(query, candidate_k):
+                faiss_id = int(result_dict['faiss_id'])
+                vector_by_id[faiss_id] = SearchResult(
                     text=result_dict['text'],
                     similarity_score=result_dict.get('similarity_score', result_dict.get('score', 0.0)),
                     relevance_score=result_dict.get('relevance_score', result_dict.get('score', 0.0)),
@@ -572,21 +666,22 @@ class FaissVectorDB:
                     strategies_used=['vector']
                 )
 
-            # Search with expanded queries (if enabled and domain terms detected)
             if (self.config.ENABLE_QUERY_EXPANSION and
                 enhanced_query.expanded_variants and
                 enhanced_query.metadata.get('has_domain_terms', False)):
-
-                for expanded_query in enhanced_query.expanded_variants[:3]:  # Use top 3
+                for expanded_query in enhanced_query.expanded_variants[:3]:
                     expanded_results = self._execute_vector_search(expanded_query, top_k)
                     for result_dict in expanded_results:
-                        faiss_id = result_dict['faiss_id']
-                        if faiss_id in all_results:
-                            # Update strategies_used
-                            if 'vector_expanded' not in all_results[faiss_id].strategies_used:
-                                all_results[faiss_id].strategies_used.append('vector_expanded')
+                        faiss_id = int(result_dict['faiss_id'])
+                        if faiss_id in vector_by_id:
+                            if 'vector_expanded' not in vector_by_id[faiss_id].strategies_used:
+                                vector_by_id[faiss_id].strategies_used.append('vector_expanded')
+                            vector_by_id[faiss_id].relevance_score = max(
+                                vector_by_id[faiss_id].relevance_score,
+                                result_dict.get('relevance_score', result_dict.get('score', 0.0)),
+                            )
                         else:
-                            all_results[faiss_id] = SearchResult(
+                            vector_by_id[faiss_id] = SearchResult(
                                 text=result_dict['text'],
                                 similarity_score=result_dict.get('similarity_score', result_dict.get('score', 0.0)),
                                 relevance_score=result_dict.get('relevance_score', result_dict.get('score', 0.0)),
@@ -595,76 +690,72 @@ class FaissVectorDB:
                                 strategies_used=['vector_expanded']
                             )
 
-            # Step 3: Apply exact field matching as fallback (if enabled)
-            # 修改逻辑：如果向量搜索结果相关性普遍较低（<0.3），也启用精确匹配
-            avg_relevance = np.mean([r.relevance_score for r in all_results.values()]) if all_results else 0.0
-            use_exact_fallback = (
-                self.config.ENABLE_EXACT_MATCH_FALLBACK and
-                (len(all_results) < top_k or avg_relevance < 0.3)
+            avg_relevance = (
+                float(np.mean([r.relevance_score for r in vector_by_id.values()]))
+                if vector_by_id
+                else 0.0
             )
-
-            if use_exact_fallback:
-                exact_results = self._execute_exact_match_search(query, top_k)
-                logger.info(f"Applying exact match fallback (results: {len(all_results)}, avg_relevance: {avg_relevance:.3f})")
-                for result_dict in exact_results:
-                    faiss_id = result_dict['faiss_id']
-                    if faiss_id in all_results:
-                        if 'exact' not in all_results[faiss_id].strategies_used:
-                            all_results[faiss_id].strategies_used.append('exact')
-                            # 提升精确匹配的相关性分数
-                            all_results[faiss_id].relevance_score = max(all_results[faiss_id].relevance_score, 0.8)
-                    else:
-                        all_results[faiss_id] = SearchResult(
-                            text=result_dict['text'],
-                            similarity_score=result_dict['score'],
-                            relevance_score=result_dict['score'],
-                            faiss_id=faiss_id,
-                            match_type='exact',
-                            strategies_used=['exact']
-                        )
-
-            # Step 3.5: Apply BM25 keyword search as fallback (if enabled and still few lexical hits)
             lexical_hit_count = sum(
-                1 for result in all_results.values()
+                1 for result in vector_by_id.values()
                 if _lexical_overlap_score(query, result.text) > 0
             )
-            if (coordinator.is_bm25_available() and
-                self.config.ENABLE_BM25_FALLBACK and
-                (len(all_results) < top_k or lexical_hit_count < min(top_k, 3))):
-
-                logger.info(
-                    "Applying BM25 fallback search "
-                    f"(current results: {len(all_results)}, lexical hits: {lexical_hit_count})"
+            run_exact = bool(
+                self.config.ENABLE_EXACT_MATCH_FALLBACK
+                and (
+                    hybrid_enabled
+                    or len(vector_by_id) < top_k
+                    or avg_relevance < 0.3
                 )
-                bm25_results = coordinator.search_bm25(query, top_k)
+            )
+            exact_results = []
+            if run_exact:
+                exact_results = [
+                    SearchResult(
+                        text=item['text'],
+                        similarity_score=item['score'],
+                        relevance_score=item['score'],
+                        faiss_id=int(item['faiss_id']),
+                        match_type='exact',
+                        strategies_used=['exact'],
+                    )
+                    for item in self._execute_exact_match_search(query, candidate_k)
+                ]
 
-                for result in bm25_results:
-                    if not self._is_searchable_text(result.text):
-                        continue
+            run_bm25 = bool(
+                self.config.ENABLE_BM25_FALLBACK
+                and coordinator.is_bm25_available()
+                and (
+                    hybrid_enabled
+                    or len(vector_by_id) < top_k
+                    or lexical_hit_count < min(top_k, 3)
+                )
+            )
+            bm25_results = coordinator.search_bm25(query, candidate_k) if run_bm25 else []
+            bm25_results = [
+                result
+                for result in bm25_results
+                if result.faiss_id >= 0 and self._is_searchable_text(result.text)
+            ]
 
-                    # Use chunk_id as key for BM25 results
-                    result_key = f"chunk_{result.chunk_id}"
-
-                    # Check if we already have this result (by text similarity)
-                    is_duplicate = False
-                    for existing in all_results.values():
-                        if existing.text == result.text:
-                            is_duplicate = True
-                            if 'bm25' not in existing.strategies_used:
-                                existing.strategies_used.append('bm25')
-                            break
-
-                    if not is_duplicate:
-                        # Use negative FAISS ID for BM25 results
-                        bm25_faiss_id = -(len(all_results) + 1)
-                        all_results[bm25_faiss_id] = result
-                        logger.info(f"Added BM25 result: {result.chunk_id}")
-
-            # Convert to list
-            results_list = list(all_results.values())
+            strategy_results = {
+                'vector': list(vector_by_id.values()),
+                'bm25': bm25_results,
+                'exact': exact_results,
+            }
+            results_list = coordinator.result_fusion.fuse(
+                strategy_results,
+                candidate_k,
+            )
 
             if not results_list:
                 logger.info("Enhanced search found no results")
+                self._record_hybrid_search(
+                    started_at,
+                    {
+                        name: len(results)
+                        for name, results in strategy_results.items()
+                    },
+                )
                 return []
 
             lexical_scores = {
@@ -673,7 +764,6 @@ class FaissVectorDB:
             }
             has_lexical_candidates = any(score > 0 for score in lexical_scores.values())
 
-            # Step 4: Calculate adaptive threshold
             relevance_scores = [r.relevance_score for r in results_list]
             threshold, adjustments = coordinator.calculate_adaptive_threshold(
                 query, relevance_scores, len(results_list)
@@ -683,7 +773,6 @@ class FaissVectorDB:
             if adjustments:
                 logger.debug(f"Threshold adjustments: {adjustments}")
 
-            # Step 5: Filter results
             filtered_results = [r for r in results_list if r.relevance_score >= threshold]
 
             # Keep lexical hits for technical/document queries. Pure vector hits with
@@ -710,9 +799,12 @@ class FaissVectorDB:
                 filtered_results = sorted(results_list, key=lambda x: x.relevance_score, reverse=True)
                 logger.warning("No results passed threshold, returning all results sorted by relevance")
 
-            # Sort by relevance score
             filtered_results.sort(
-                key=lambda x: (lexical_scores.get(id(x), 0.0), x.relevance_score),
+                key=lambda x: (
+                    x.composite_score,
+                    lexical_scores.get(id(x), 0.0),
+                    x.relevance_score,
+                ),
                 reverse=True,
             )
 
@@ -732,7 +824,10 @@ class FaissVectorDB:
                     "match_type": result.match_type,
                     "strategies_used": result.strategies_used,
                     "lexical_score": float(lexical_scores.get(id(result), 0.0)),
-                    "search_method": "enhanced"
+                    "rrf_score": float(result.rrf_score),
+                    "composite_score": float(result.composite_score),
+                    "rank": i + 1,
+                    "search_method": "hybrid" if hybrid_enabled else "enhanced",
                 }
 
                 # Add quality metrics to first result only
@@ -747,12 +842,22 @@ class FaissVectorDB:
 
                 formatted_results.append(result_dict)
 
-            logger.info(f"Enhanced search complete: {len(formatted_results)} results (threshold: {threshold:.3f})")
+            self._record_hybrid_search(
+                started_at,
+                {
+                    name: len(results)
+                    for name, results in strategy_results.items()
+                },
+            )
+            logger.info(
+                f"Hybrid search complete: {len(formatted_results)} results "
+                f"(threshold: {threshold:.3f})"
+            )
             return formatted_results
 
         except Exception as e:
             logger.error(f"Enhanced search failed: {e}, falling back to traditional search")
-            # Fallback to traditional search
+            self._record_hybrid_search(started_at, fallback=True)
             return self._traditional_search(query, top_k)
 
     def _execute_vector_search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
@@ -809,37 +914,28 @@ class FaissVectorDB:
         return results
 
     def _execute_exact_match_search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
-        """Execute exact field matching search on metadata"""
-        results = []
-        query_lower = query.lower()
+        """Execute indexed full-text equality matching on SQLite metadata."""
+        normalized_query = query.strip()
+        if not normalized_query:
+            return []
 
-        # Get all chunks
-        self._sync_active_metadata_cache()
-        for faiss_id_str, text in self.id_to_chunk.items():
-            faiss_id = int(faiss_id_str)
-            text_lower = text.lower()
-            if not self._is_searchable_text(text):
-                continue
+        if self.metadata_store:
+            vector_ids = self.metadata_store.get_active_ids_for_text(normalized_query)
+        else:
+            vector_id = self.chunk_to_id.get(normalized_query)
+            vector_ids = [int(vector_id)] if vector_id is not None else []
 
-            # Check for exact match in text
-            if query_lower in text_lower:
-                # Calculate score based on match quality
-                if query_lower == text_lower:
-                    score = 1.0
-                elif query_lower in text_lower:
-                    score = 0.8
-
-                results.append({
-                    "text": text,
-                    "score": score,
-                    "similarity_score": score,
-                    "relevance_score": score,
-                    "faiss_id": faiss_id
-                })
-
-        # Sort by score and return top_k
-        results.sort(key=lambda x: x['score'], reverse=True)
-        return results[:top_k]
+        return [
+            {
+                "text": normalized_query,
+                "score": 1.0,
+                "similarity_score": 1.0,
+                "relevance_score": 1.0,
+                "faiss_id": int(vector_id),
+            }
+            for vector_id in vector_ids[:top_k]
+            if self._is_searchable_text(normalized_query)
+        ]
     
     def delete_texts(self, texts_to_delete: List[str]) -> int:
         """精确删除指定文本。
@@ -1029,9 +1125,452 @@ class FaissVectorDB:
                 logger.error(f"批量更新失败: {e}")
                 raise HTTPException(status_code=500, detail=f"批量更新失败: {str(e)}")
 
+    def _validate_sql_template_record(
+        self,
+        record: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        required_fields = (
+            "external_id",
+            "dataset_id",
+            "template_id",
+            "intent_key",
+            "canonical_template",
+            "search_text",
+            "required_slots",
+            "sql_template",
+            "schema_fingerprint",
+            "template_version",
+        )
+        missing = [field for field in required_fields if not record.get(field)]
+        if missing:
+            raise ValueError(
+                "Missing SQL template fields: " + ", ".join(sorted(missing))
+            )
+
+        normalized = dict(record)
+        for field in (
+            "external_id",
+            "dataset_id",
+            "template_id",
+            "intent_key",
+            "canonical_template",
+            "search_text",
+            "sql_template",
+            "schema_fingerprint",
+        ):
+            normalized[field] = str(normalized[field]).strip()
+
+        for field in ("external_id", "dataset_id", "template_id", "intent_key"):
+            if not SQL_TEMPLATE_NAME_PATTERN.fullmatch(normalized[field]):
+                raise ValueError(f"Invalid SQL template {field}: {normalized[field]}")
+
+        normalized["template_version"] = int(normalized["template_version"])
+        if normalized["template_version"] <= 0:
+            raise ValueError("template_version must be positive")
+
+        status = str(normalized.get("status", "pending_review")).strip()
+        if status not in SQL_TEMPLATE_STATUSES:
+            raise ValueError(f"Invalid SQL template status: {status}")
+        normalized["status"] = status
+        normalized["source"] = str(normalized.get("source", "manual")).strip()
+
+        required_slots = normalized["required_slots"]
+        if not isinstance(required_slots, dict) or not required_slots:
+            raise ValueError("required_slots must be a non-empty object")
+        for slot_name, slot_type in required_slots.items():
+            if not SQL_TEMPLATE_SLOT_NAME_PATTERN.fullmatch(str(slot_name)):
+                raise ValueError(f"Invalid SQL template slot name: {slot_name}")
+            if str(slot_type) not in SQL_TEMPLATE_SLOT_TYPES:
+                raise ValueError(
+                    f"Unsupported SQL template slot type: {slot_type}"
+                )
+        normalized["required_slots"] = {
+            str(name): str(slot_type)
+            for name, slot_type in required_slots.items()
+        }
+
+        sql = normalized["sql_template"]
+        if not sql.upper().startswith(("SELECT", "WITH")):
+            raise ValueError("sql_template must start with SELECT or WITH")
+        if ";" in sql.rstrip(";"):
+            raise ValueError("sql_template must contain a single statement")
+        placeholders = set(SQL_TEMPLATE_SLOT_PATTERN.findall(sql))
+        declared_slots = set(normalized["required_slots"])
+        if placeholders != declared_slots:
+            raise ValueError(
+                "sql_template placeholders must exactly match required_slots"
+            )
+        return normalized
+
+    def upsert_sql_template(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """Upsert a SQL template while embedding only its search_text."""
+        with self.lock:
+            if not self.metadata_store:
+                raise ValueError("SQLite metadata store is required")
+
+            normalized = self._validate_sql_template_record(record)
+            external_id = normalized["external_id"]
+            existing = self.metadata_store.get_sql_template(external_id)
+            old_vector_id = existing.get("vector_id") if existing else None
+            vector_id = old_vector_id
+            added_vector_id = None
+
+            needs_index = normalized["status"] == "active"
+            search_text_changed = bool(
+                existing and existing.get("search_text") != normalized["search_text"]
+            )
+            old_vector_active = bool(
+                old_vector_id is not None
+                and self.metadata_store.is_active(int(old_vector_id))
+            )
+
+            if needs_index and (search_text_changed or not old_vector_active):
+                embeddings = self.embedding_model.encode(
+                    [normalized["search_text"]],
+                    convert_to_numpy=True,
+                    show_progress_bar=False,
+                    normalize_embeddings=True,
+                    batch_size=self.config.BATCH_SIZE,
+                )
+                vector_ids = self.metadata_store.add_chunks(
+                    [normalized["search_text"]],
+                    source_document=f"sql-template:{external_id}",
+                )
+                added_vector_id = int(vector_ids[0])
+                try:
+                    self._add_embeddings_with_ids(embeddings, [added_vector_id])
+                except Exception:
+                    self.metadata_store.soft_delete_vector_ids([added_vector_id])
+                    self._sync_active_metadata_cache()
+                    raise
+                vector_id = added_vector_id
+            elif not needs_index:
+                vector_id = None
+
+            try:
+                stored = self.metadata_store.upsert_sql_template(
+                    normalized,
+                    vector_id=vector_id,
+                )
+            except Exception:
+                if added_vector_id is not None:
+                    self.metadata_store.soft_delete_vector_ids([added_vector_id])
+                    self._sync_active_metadata_cache()
+                raise
+
+            if old_vector_id is not None and old_vector_id != vector_id:
+                self.metadata_store.soft_delete_vector_ids([int(old_vector_id)])
+
+            self._sync_active_metadata_cache()
+            if old_vector_id != vector_id:
+                self.dirty = True
+            return {
+                "action": "updated" if existing else "inserted",
+                "template": stored,
+            }
+
+    def search_sql_templates(
+        self,
+        dataset_id: str,
+        query: str,
+        top_k: int = 10,
+        intent_key: Optional[str] = None,
+        canonical_template: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Search active templates using exact template keys and hybrid retrieval."""
+        with self.lock:
+            if not self.metadata_store:
+                return []
+            dataset_id = str(dataset_id).strip()
+            if not dataset_id:
+                raise ValueError("dataset_id is required")
+            limit = max(1, min(int(top_k), 50))
+            matches: Dict[str, Dict[str, Any]] = {}
+
+            if intent_key and canonical_template:
+                exact_records = self.metadata_store.find_sql_templates(
+                    dataset_id,
+                    intent_key=str(intent_key),
+                    canonical_template=str(canonical_template),
+                    statuses=("active",),
+                    limit=limit,
+                )
+                for record in exact_records:
+                    matches[record["external_id"]] = {
+                        **record,
+                        "match_type": "template_exact",
+                        "similarity_score": 1.0,
+                        "relevance_score": 1.0,
+                        "lexical_score": 1.0,
+                        "rerank_score": 1.0,
+                        "strategies_used": ["template_key"],
+                    }
+
+            query = str(query or "").strip()
+            if query and len(matches) < limit and self.index.ntotal > 0:
+                candidates = self.search(
+                    query,
+                    max(limit * 3, limit),
+                    use_optimization=False,
+                    use_enhanced=True,
+                )
+                by_vector = self.metadata_store.get_sql_templates_by_vector_ids(
+                    [candidate.get("faiss_id", -1) for candidate in candidates],
+                    dataset_id,
+                    statuses=("active",),
+                )
+                for candidate in candidates:
+                    vector_id = int(candidate.get("faiss_id", -1))
+                    record = by_vector.get(vector_id)
+                    if record is None or record["external_id"] in matches:
+                        continue
+                    relevance = float(candidate.get("relevance_score", 0.0))
+                    lexical = float(candidate.get("lexical_score", 0.0))
+                    rerank_score = (0.7 * relevance) + (0.3 * lexical)
+                    matches[record["external_id"]] = {
+                        **record,
+                        "match_type": "template_semantic",
+                        "similarity_score": float(
+                            candidate.get("similarity_score", 0.0)
+                        ),
+                        "relevance_score": relevance,
+                        "lexical_score": lexical,
+                        "rerank_score": rerank_score,
+                        "strategies_used": list(
+                            candidate.get("strategies_used", ["vector"])
+                        ),
+                    }
+
+            ordered = sorted(
+                matches.values(),
+                key=lambda item: (
+                    item["match_type"] == "template_exact",
+                    float(item.get("rerank_score", 0.0)),
+                    int(item.get("template_version", 0)),
+                ),
+                reverse=True,
+            )
+            return ordered[:limit]
+
+    def list_sql_templates(
+        self,
+        dataset_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """List templates and their lifecycle counters for administration."""
+        with self.lock:
+            if not self.metadata_store:
+                return []
+            return self.metadata_store.list_sql_templates(
+                dataset_id=str(dataset_id).strip() if dataset_id else None,
+                status=str(status).strip() if status else None,
+                limit=limit,
+            )
+
+    def set_sql_template_status(
+        self,
+        external_id: str,
+        status: str,
+    ) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            if not self.metadata_store:
+                return None
+            existing = self.metadata_store.get_sql_template(external_id)
+            if existing is None:
+                return None
+            return self.upsert_sql_template({**existing, "status": status})["template"]
+
+    def delete_sql_template(
+        self,
+        external_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Permanently remove a SQL template and retire its search vector."""
+        with self.lock:
+            if not self.metadata_store:
+                return None
+            deleted = self.metadata_store.delete_sql_template(external_id)
+            if deleted is None:
+                return None
+            vector_id = deleted.get("vector_id")
+            if vector_id is not None:
+                self.metadata_store.soft_delete_vector_ids([int(vector_id)])
+                self._sync_active_metadata_cache()
+                self.dirty = True
+            return deleted
+
+    def record_sql_template_outcome(
+        self,
+        external_id: str,
+        outcome: str,
+    ) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            if not self.metadata_store:
+                return None
+            return self.metadata_store.record_sql_template_outcome(
+                external_id,
+                outcome,
+            )
+
+    def get_sql_template_metrics(self) -> Dict[str, Any]:
+        if not self.metadata_store:
+            return {"total_templates": 0, "by_status": {}}
+        return self.metadata_store.get_sql_template_metrics()
+
+    def migrate_sql_templates(
+        self,
+        records: Sequence[Dict[str, Any]],
+        dry_run: bool = True,
+    ) -> Dict[str, Any]:
+        """Validate or apply an explicit batch of reviewed SQL templates."""
+        if len(records) > 100:
+            raise ValueError("Maximum 100 SQL templates allowed per batch")
+        results = []
+        valid_records = []
+        for index, record in enumerate(records):
+            try:
+                normalized = self._validate_sql_template_record(record)
+                valid_records.append(normalized)
+                results.append(
+                    {
+                        "index": index,
+                        "external_id": normalized["external_id"],
+                        "valid": True,
+                        "applied": False,
+                    }
+                )
+            except Exception as error:
+                results.append(
+                    {
+                        "index": index,
+                        "external_id": str(record.get("external_id", "")),
+                        "valid": False,
+                        "applied": False,
+                        "error": str(error),
+                    }
+                )
+
+        if not dry_run:
+            valid_by_id = {
+                record["external_id"]: record for record in valid_records
+            }
+            for result in results:
+                if not result["valid"]:
+                    continue
+                applied = self.upsert_sql_template(
+                    valid_by_id[result["external_id"]]
+                )
+                result["applied"] = True
+                result["action"] = applied["action"]
+
+        return {
+            "dry_run": bool(dry_run),
+            "total_count": len(records),
+            "valid_count": sum(1 for result in results if result["valid"]),
+            "invalid_count": sum(1 for result in results if not result["valid"]),
+            "applied_count": sum(1 for result in results if result["applied"]),
+            "results": results,
+        }
+
+    def audit_sql_documents(self, detail_limit: int = 100) -> Dict[str, Any]:
+        """Inspect legacy Question/SQL chunks without modifying the index."""
+        if not self.metadata_store:
+            return {
+                "total_chunks": 0,
+                "parseable_count": 0,
+                "invalid_count": 0,
+                "duplicate_question_count": 0,
+                "details": [],
+            }
+
+        details = []
+        seen_questions: Dict[str, int] = {}
+        parseable_count = 0
+        invalid_count = 0
+        duplicate_count = 0
+        question_pattern = re.compile(
+            r"(?is)^\s*Question:\s*(.*?)\s*SQL:\s*(.+?)\s*$"
+        )
+
+        for chunk in self.metadata_store.get_active_chunks():
+            text = str(chunk["text"])
+            match = question_pattern.match(text)
+            status = "parseable"
+            reason = ""
+            question = ""
+            sql = ""
+            if match is None:
+                status = "invalid"
+                reason = "missing_question_or_sql_marker"
+            else:
+                question = match.group(1).strip()
+                sql = match.group(2).strip()
+                if not question:
+                    status = "invalid"
+                    reason = "empty_question"
+                elif not sql.upper().startswith(("SELECT", "WITH")):
+                    status = "invalid"
+                    reason = "unsupported_or_incomplete_sql"
+                elif len(text) >= self.config.MAX_CHUNK_SIZE:
+                    status = "invalid"
+                    reason = "chunk_at_size_limit"
+
+            canonical_question = ""
+            if status == "parseable":
+                parseable_count += 1
+                canonical_question = "".join(
+                    character.lower()
+                    for character in unicodedata.normalize("NFKC", question)
+                    if not character.isspace()
+                    and not unicodedata.category(character).startswith("P")
+                )
+                seen_questions[canonical_question] = (
+                    seen_questions.get(canonical_question, 0) + 1
+                )
+                if seen_questions[canonical_question] > 1:
+                    duplicate_count += 1
+            else:
+                invalid_count += 1
+
+            if len(details) < max(1, min(int(detail_limit), 500)):
+                details.append(
+                    {
+                        "vector_id": int(chunk["vector_id"]),
+                        "status": status,
+                        "reason": reason,
+                        "question": question,
+                        "canonical_question_hash": (
+                            hashlib.sha256(
+                                canonical_question.encode("utf-8")
+                            ).hexdigest()
+                            if canonical_question
+                            else ""
+                        ),
+                        "sql_hash": (
+                            hashlib.sha256(sql.encode("utf-8")).hexdigest()
+                            if sql
+                            else ""
+                        ),
+                    }
+                )
+
+        duplicate_groups = sum(
+            1 for count in seen_questions.values() if count > 1
+        )
+        return {
+            "total_chunks": len(self.metadata_store.get_active_vector_ids()),
+            "parseable_count": parseable_count,
+            "invalid_count": invalid_count,
+            "duplicate_question_count": duplicate_count,
+            "duplicate_question_groups": duplicate_groups,
+            "details": details,
+        }
+
     def save(self):
         """保存索引和元数据"""
         with self.lock:
+            temp_index_file = f"{self.index_file}.tmp"
+            temp_metadata_file = f"{self.metadata_file}.tmp"
             try:
                 if not self.dirty:
                     logger.info("没有更改，跳过保存")
@@ -1042,13 +1581,15 @@ class FaissVectorDB:
                 logger.debug(f"确保数据目录存在: {self.data_dir}")
 
                 # 原子性保存：先保存到临时文件
-                temp_index_file = f"{self.index_file}.tmp"
-                temp_metadata_file = f"{self.metadata_file}.tmp"
-
                 # 保存FAISS索引
                 faiss.write_index(self.index, temp_index_file)
+                with open(temp_index_file, "rb") as index_file:
+                    os.fsync(index_file.fileno())
 
                 self._sync_active_metadata_cache()
+                self._validate_index_metadata_consistency()
+                if self.metadata_store:
+                    self.metadata_store.checkpoint()
 
                 # 保存元数据为JSON（兼容 BM25 和旧部署；主元数据在 SQLite）
                 metadata = {
@@ -1063,10 +1604,17 @@ class FaissVectorDB:
 
                 with open(temp_metadata_file, 'w', encoding='utf-8') as f:
                     json.dump(metadata, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
 
                 # 原子性重命名
-                Path(temp_index_file).rename(self.index_file)
-                Path(temp_metadata_file).rename(self.metadata_file)
+                os.replace(temp_index_file, self.index_file)
+                os.replace(temp_metadata_file, self.metadata_file)
+                directory_fd = os.open(self.data_dir, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
 
                 self.dirty = False
                 logger.info("索引和元数据保存成功")
@@ -1087,9 +1635,21 @@ class FaissVectorDB:
             # 加载FAISS索引
             self.index = faiss.read_index(self.index_file)
 
-            # 加载元数据（JSON格式）
-            with open(self.metadata_file, 'r', encoding='utf-8') as f:
-                metadata = json.load(f)
+            # JSON 仅用于旧版本迁移和兼容导出；SQLite 是运行时事实源。
+            metadata: Dict[str, Any] = {}
+            try:
+                with open(self.metadata_file, 'r', encoding='utf-8') as f:
+                    metadata = json.load(f)
+            except FileNotFoundError:
+                if not self.metadata_store or not self.metadata_store.get_all_vector_ids():
+                    if self.index.ntotal > 0:
+                        raise IndexMetadataConsistencyError(
+                            "FAISS 索引存在，但 JSON 与 SQLite 元数据均不可用"
+                        )
+            except json.JSONDecodeError:
+                if not self.metadata_store or not self.metadata_store.get_all_vector_ids():
+                    raise
+                logger.warning("兼容 JSON 元数据损坏，继续使用 SQLite 事实源")
 
             self.id_to_chunk = metadata.get("id_to_chunk", {})
             self.chunk_to_id = metadata.get("chunk_to_id", {})
@@ -1102,9 +1662,13 @@ class FaissVectorDB:
                     if str(vector_id).lstrip("-").isdigit()
                 ]
                 self.metadata_store.import_active_chunks(legacy_chunks)
-                self._sync_active_metadata_cache()
+            self._sync_active_metadata_cache()
+            consistency = self._validate_index_metadata_consistency()
 
-            logger.info(f"成功加载索引，包含 {self.index.ntotal} 个向量")
+            logger.info(
+                f"成功加载索引，包含 {self.index.ntotal} 个向量，"
+                f"活动元数据 {consistency['active_metadata_id_count']} 条"
+            )
 
         except FileNotFoundError as e:
             logger.warning(f"索引文件不存在: {e}")
@@ -1127,7 +1691,20 @@ class FaissVectorDB:
                 "has_unsaved_changes": self.dirty,
                 "search_optimization_enabled": hasattr(self, 'advanced_search_index'),
                 "metadata_backend": "sqlite" if self.metadata_store else "json",
+                "auto_save": bool(self.config.AUTO_SAVE),
+                "index_consistency": self._get_index_consistency(),
             }
+
+            hybrid_metrics = dict(self.hybrid_search_metrics)
+            search_count = int(hybrid_metrics["search_count"])
+            hybrid_metrics["average_latency_ms"] = (
+                hybrid_metrics["total_latency_ms"] / search_count
+                if search_count
+                else 0.0
+            )
+            stats["hybrid_retrieval"] = hybrid_metrics
+            if hasattr(self, "enhancement_coordinator"):
+                stats["bm25"] = self.enhancement_coordinator.get_bm25_stats()
 
             # 添加索引特定的状态信息
             if self.index:
@@ -1178,7 +1755,7 @@ class FaissVectorDB:
 
             vectors = []
             new_chunks = []
-            for new_vector_id, chunk in enumerate(active_chunks, start=1):
+            for chunk in active_chunks:
                 old_vector_id = int(chunk["vector_id"])
                 try:
                     vector = self.index.reconstruct(old_vector_id)
@@ -1191,7 +1768,7 @@ class FaissVectorDB:
                         ),
                     ) from e
                 vectors.append(vector)
-                new_chunks.append((new_vector_id, chunk["text"]))
+                new_chunks.append((old_vector_id, chunk["text"]))
 
             compacted_index = self._create_index()
             embeddings = np.asarray(vectors, dtype=np.float32)
@@ -1689,6 +2266,163 @@ def get_mcp_tools() -> List[MCPTool]:
             }
         ),
         MCPTool(
+            name="template_upsert",
+            description=(
+                "按 external_id 幂等写入结构化 SQL 模板。"
+                "仅 search_text 进入向量索引，SQL 和槽位保存在 SQLite payload。"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "businesstype": {"type": "string"},
+                    "record": {"type": "object"},
+                },
+                "required": ["record"],
+            },
+        ),
+        MCPTool(
+            name="template_search",
+            description=(
+                "按 dataset、模板 key 和混合检索候选搜索 active SQL 模板，"
+                "返回结构化 payload、分数和策略。"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "businesstype": {"type": "string"},
+                    "dataset_id": {"type": "string"},
+                    "query": {"type": "string", "default": ""},
+                    "intent_key": {"type": "string"},
+                    "canonical_template": {"type": "string"},
+                    "top_k": {
+                        "type": "integer",
+                        "default": 10,
+                        "minimum": 1,
+                        "maximum": 50,
+                    },
+                },
+                "required": ["dataset_id"],
+            },
+        ),
+        MCPTool(
+            name="template_list",
+            description=(
+                "列出 SQL 模板及其状态、复用次数、最近使用时间和结构化内容。"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "businesstype": {"type": "string"},
+                    "dataset_id": {"type": "string"},
+                    "status": {
+                        "type": "string",
+                        "enum": sorted(SQL_TEMPLATE_STATUSES),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 200,
+                        "minimum": 1,
+                        "maximum": 500,
+                    },
+                },
+            },
+        ),
+        MCPTool(
+            name="template_status",
+            description="启用、停用或标记待复核/失效 SQL 模板。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "businesstype": {"type": "string"},
+                    "external_id": {"type": "string"},
+                    "status": {
+                        "type": "string",
+                        "enum": sorted(SQL_TEMPLATE_STATUSES),
+                    },
+                },
+                "required": ["external_id", "status"],
+            },
+        ),
+        MCPTool(
+            name="template_delete",
+            description="按 external_id 永久删除 SQL 模板及其检索向量。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "businesstype": {"type": "string"},
+                    "external_id": {"type": "string"},
+                },
+                "required": ["external_id"],
+            },
+        ),
+        MCPTool(
+            name="template_outcome",
+            description="记录 SQL 模板复用、shadow、校验失败或成功证据。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "businesstype": {"type": "string"},
+                    "external_id": {"type": "string"},
+                    "outcome": {
+                        "type": "string",
+                        "enum": [
+                            "reuse",
+                            "shadow_match",
+                            "validation_failure",
+                            "success",
+                        ],
+                    },
+                },
+                "required": ["external_id", "outcome"],
+            },
+        ),
+        MCPTool(
+            name="template_stats",
+            description="获取 SQL 模板状态与复用效果统计。",
+            inputSchema={
+                "type": "object",
+                "properties": {"businesstype": {"type": "string"}},
+            },
+        ),
+        MCPTool(
+            name="template_migrate",
+            description=(
+                "批量校验或迁移已审核的结构化 SQL 模板。"
+                "默认 dry_run=true，不写入索引。"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "businesstype": {"type": "string"},
+                    "records": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "maxItems": 100,
+                    },
+                    "dry_run": {"type": "boolean", "default": True},
+                },
+                "required": ["records"],
+            },
+        ),
+        MCPTool(
+            name="sql_document_audit",
+            description=(
+                "只读审计现有 Question/SQL 文档的完整性和规范化问题重复情况。"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "businesstype": {"type": "string"},
+                    "detail_limit": {
+                        "type": "integer",
+                        "default": 100,
+                        "minimum": 1,
+                        "maximum": 500,
+                    },
+                },
+            },
+        ),
+        MCPTool(
             name="compact",
             description="压缩索引，物理移除软删除向量。建议 deleted_ratio 超过 0.3 时执行。",
             inputSchema={
@@ -1774,7 +2508,12 @@ async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, An
                 "relevant_chunks": [result["text"] for result in results],
                 "detailed_results": results,
                 "query": query,
-                "total_found": len(results)
+                "total_found": len(results),
+                "search_method": (
+                    results[0].get("search_method", "enhanced")
+                    if results
+                    else "enhanced"
+                ),
             }
 
             return {
@@ -1886,6 +2625,171 @@ async def execute_mcp_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, An
                 "content": [{
                     "type": "text",
                     "text": json.dumps(response, ensure_ascii=False, indent=2)
+                }]
+            }
+
+        elif name == "template_upsert":
+            record = arguments.get("record")
+            if not isinstance(record, dict):
+                raise ValueError("record parameter is required")
+            response = vector_db.upsert_sql_template(record)
+            if config.AUTO_SAVE and vector_db.dirty:
+                vector_db.save()
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(response, ensure_ascii=False, indent=2),
+                }]
+            }
+
+        elif name == "template_search":
+            dataset_id = arguments.get("dataset_id")
+            if not dataset_id:
+                raise ValueError("dataset_id parameter is required")
+            matches = vector_db.search_sql_templates(
+                dataset_id=str(dataset_id),
+                query=str(arguments.get("query", "")),
+                top_k=int(arguments.get("top_k", 10)),
+                intent_key=arguments.get("intent_key"),
+                canonical_template=arguments.get("canonical_template"),
+            )
+            scores = [float(match.get("rerank_score", 0.0)) for match in matches]
+            top1_score = scores[0] if scores else 0.0
+            top2_score = scores[1] if len(scores) > 1 else 0.0
+            response = {
+                "templates": matches,
+                "total_found": len(matches),
+                "top1_score": top1_score,
+                "top2_score": top2_score,
+                "margin": top1_score - top2_score,
+            }
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(response, ensure_ascii=False, indent=2),
+                }]
+            }
+
+        elif name == "template_list":
+            templates = vector_db.list_sql_templates(
+                dataset_id=arguments.get("dataset_id"),
+                status=arguments.get("status"),
+                limit=int(arguments.get("limit", 200)),
+            )
+            response = {
+                "templates": templates,
+                "total_found": len(templates),
+            }
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(response, ensure_ascii=False, indent=2),
+                }]
+            }
+
+        elif name == "template_status":
+            external_id = str(arguments.get("external_id", "")).strip()
+            status = str(arguments.get("status", "")).strip()
+            if not external_id or not status:
+                raise ValueError("external_id and status are required")
+            template = vector_db.set_sql_template_status(external_id, status)
+            if template is None:
+                raise ValueError(f"SQL template not found: {external_id}")
+            if config.AUTO_SAVE and vector_db.dirty:
+                vector_db.save()
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(
+                        {"template": template},
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                }]
+            }
+
+        elif name == "template_delete":
+            external_id = str(arguments.get("external_id", "")).strip()
+            if not external_id:
+                raise ValueError("external_id is required")
+            template = vector_db.delete_sql_template(external_id)
+            if template is None:
+                raise ValueError(f"SQL template not found: {external_id}")
+            if config.AUTO_SAVE and vector_db.dirty:
+                vector_db.save()
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(
+                        {
+                            "external_id": external_id,
+                            "status": "deleted",
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                }]
+            }
+
+        elif name == "template_outcome":
+            external_id = str(arguments.get("external_id", "")).strip()
+            outcome = str(arguments.get("outcome", "")).strip()
+            if not external_id or not outcome:
+                raise ValueError("external_id and outcome are required")
+            template = vector_db.record_sql_template_outcome(
+                external_id,
+                outcome,
+            )
+            if template is None:
+                raise ValueError(f"SQL template not found: {external_id}")
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(
+                        {"template": template},
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                }]
+            }
+
+        elif name == "template_stats":
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(
+                        vector_db.get_sql_template_metrics(),
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                }]
+            }
+
+        elif name == "template_migrate":
+            records = arguments.get("records")
+            if not isinstance(records, list):
+                raise ValueError("records parameter is required")
+            response = vector_db.migrate_sql_templates(
+                records,
+                dry_run=bool(arguments.get("dry_run", True)),
+            )
+            if config.AUTO_SAVE and response["applied_count"] > 0:
+                vector_db.save()
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(response, ensure_ascii=False, indent=2),
+                }]
+            }
+
+        elif name == "sql_document_audit":
+            response = vector_db.audit_sql_documents(
+                int(arguments.get("detail_limit", 100))
+            )
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(response, ensure_ascii=False, indent=2),
                 }]
             }
 
@@ -2059,7 +2963,7 @@ async def add_document(doc: Document, background_tasks: BackgroundTasks):
         
         # 后台保存（如果启用自动保存）
         if config.AUTO_SAVE:
-            background_tasks.add_task(vector_db.save)
+            vector_db.save()
         
         return {
             "message": f"文档处理成功，新增 {len(chunks)} 个知识块",
@@ -2092,7 +2996,7 @@ async def delete_document(doc: Document, background_tasks: BackgroundTasks):
         deleted_count = vector_db.delete_texts(chunks)
         
         if config.AUTO_SAVE and deleted_count > 0:
-            background_tasks.add_task(vector_db.save)
+            vector_db.save()
         
         return {
             "message": f"成功删除 {deleted_count} 个知识块",
@@ -2134,7 +3038,7 @@ async def update_documents(request: UpdateRequest, background_tasks: BackgroundT
 
         # 后台保存（如果启用自动保存）
         if config.AUTO_SAVE and result["success_count"] > 0:
-            background_tasks.add_task(vector_db.save)
+            vector_db.save()
 
         return {
             "message": f"更新完成: 成功 {result['success_count']}, 新增 {result['inserted_count']}, 更新 {result['updated_count']}, 失败 {result['failed_count']}",
@@ -2160,7 +3064,7 @@ async def compact_index(request: CompactRequest, background_tasks: BackgroundTas
         result = vector_db.compact_index()
 
         if config.AUTO_SAVE:
-            background_tasks.add_task(vector_db.save)
+            vector_db.save()
 
         return result
 
@@ -2195,7 +3099,15 @@ async def search_knowledge(query: Query):
         results = vector_db.search(query.question, query.top_k, query.use_optimization)
 
         # 添加搜索方法信息
-        search_method = "optimized" if query.use_optimization and hasattr(vector_db, 'advanced_search_index') else "traditional"
+        search_method = (
+            results[0].get("search_method")
+            if results
+            else (
+                "optimized"
+                if query.use_optimization and hasattr(vector_db, 'advanced_search_index')
+                else "traditional"
+            )
+        )
 
         return {
             "relevant_chunks": [result["text"] for result in results],

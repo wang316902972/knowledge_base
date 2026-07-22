@@ -8,7 +8,7 @@ import json
 from logger import setup_logger
 import re
 import numpy as np
-from typing import List, Dict, Any, Optional, Tuple, Union
+from typing import Callable, List, Dict, Any, Optional, Tuple, Union
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -76,12 +76,14 @@ class SearchResult:
     @classmethod
     def from_bm25(cls, bm25_result: 'BM25SearchResult') -> 'SearchResult':
         """Create SearchResult from BM25SearchResult"""
+        chunk_id = str(bm25_result.chunk_id)
+        faiss_id = int(chunk_id) if chunk_id.isdigit() else -1
         return cls(
             text=bm25_result.text,
             similarity_score=bm25_result.score,
             relevance_score=min(bm25_result.score / 10.0, 1.0),  # Normalize to 0-1
-            faiss_id=-1,
-            chunk_id=bm25_result.chunk_id,
+            faiss_id=faiss_id,
+            chunk_id=chunk_id,
             match_type='bm25',
             strategies_used=['bm25']
         )
@@ -302,54 +304,57 @@ class ResultFusion:
         Returns:
             Fused and ranked list of search results
         """
-        # Calculate RRF scores using unique keys (faiss_id or chunk_id)
-        rrf_scores = {}
+        rrf_scores: Dict[str, float] = {}
+        representatives: Dict[str, SearchResult] = {}
+        representative_priorities: Dict[str, int] = {}
+        strategies_by_key: Dict[str, List[str]] = {}
 
         for strategy, results in results_dict.items():
             weight = self.weights.get(strategy, 1.0)
             for rank, result in enumerate(results, 1):
                 rrf_score = weight / (self.rrf_k + rank)
-                # Use faiss_id for vector results, chunk_id for BM25
                 result_key = self._get_result_key(result)
+                rrf_scores[result_key] = rrf_scores.get(result_key, 0.0) + rrf_score
+                strategies = strategies_by_key.setdefault(result_key, [])
+                for used_strategy in [*result.strategies_used, strategy]:
+                    if used_strategy not in strategies:
+                        strategies.append(used_strategy)
 
-                if result_key in rrf_scores:
-                    rrf_scores[result_key] += rrf_score
-                    # Track which strategies found this result
-                    for existing_result in self._find_results_by_key(results_dict.values(), result_key):
-                        if strategy not in existing_result.strategies_used:
-                            existing_result.strategies_used.append(strategy)
-                else:
-                    rrf_scores[result_key] = rrf_score
-                    result.rrf_score = rrf_score
-                    result.strategies_used.append(strategy)
+                existing = representatives.get(result_key)
+                priority = {"exact": 3, "vector": 2, "bm25": 1}.get(strategy, 0)
+                existing_priority = representative_priorities.get(result_key, -1)
+                if (
+                    existing is None
+                    or priority > existing_priority
+                    or (
+                        priority == existing_priority
+                        and result.relevance_score > existing.relevance_score
+                    )
+                ):
+                    representatives[result_key] = result
+                    representative_priorities[result_key] = priority
 
         # Sort by RRF score
         sorted_keys = sorted(rrf_scores.keys(),
                            key=lambda x: rrf_scores[x],
                            reverse=True)
 
-        # Collect unique results
-        all_results = []
-        seen_keys = set()
-
-        for strategy_results in results_dict.values():
-            for result in strategy_results:
-                result_key = self._get_result_key(result)
-                if result_key not in seen_keys:
-                    all_results.append(result)
-                    seen_keys.add(result_key)
-
-        # Build final results list
         final_results = []
         for result_key in sorted_keys[:top_k]:
-            for result in all_results:
-                if self._get_result_key(result) == result_key:
-                    # Update RRF score and composite score
-                    result.rrf_score = rrf_scores[result_key]
-                    result.composite_score = self._calculate_composite_score(result)
-                    result.match_type = 'hybrid' if len(result.strategies_used) > 1 else result.strategies_used[0]
-                    final_results.append(result)
-                    break
+            result = representatives[result_key]
+            result.strategies_used = strategies_by_key[result_key]
+            result.rrf_score = rrf_scores[result_key]
+            result.composite_score = self._calculate_composite_score(result)
+            primary_strategies = [
+                strategy
+                for strategy in result.strategies_used
+                if strategy in self.weights
+            ]
+            if len(primary_strategies) > 1:
+                result.match_type = 'hybrid'
+            elif primary_strategies:
+                result.match_type = primary_strategies[0]
+            final_results.append(result)
 
         # Assign ranks
         for rank, result in enumerate(final_results, 1):
@@ -469,7 +474,14 @@ class QualityMetricsCalculator:
 class RetrievalEnhancementCoordinator:
     """Coordinates all retrieval enhancement components"""
 
-    def __init__(self, config, model: SentenceTransformer, businesstype: str = "default"):
+    def __init__(
+        self,
+        config,
+        model: SentenceTransformer,
+        businesstype: str = "default",
+        documents_provider: Optional[Callable[[], Dict[str, str]]] = None,
+        revision_provider: Optional[Callable[[], int]] = None,
+    ):
         self.config = config
         self.model = model
         self.businesstype = businesstype
@@ -490,7 +502,12 @@ class RetrievalEnhancementCoordinator:
         enable_bm25 = getattr(config, 'ENABLE_BM25_FALLBACK', True)
         if BM25_AVAILABLE and enable_bm25:
             metadata_file = config.get_metadata_file(businesstype)
-            self.bm25_strategy = BM25SearchStrategy(str(metadata_file), businesstype)
+            self.bm25_strategy = BM25SearchStrategy(
+                str(metadata_file),
+                businesstype,
+                documents_provider=documents_provider,
+                revision_provider=revision_provider,
+            )
             if self.bm25_strategy.is_available():
                 logger.info(f"[{businesstype}] BM25 search strategy initialized")
             else:

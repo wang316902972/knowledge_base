@@ -4,7 +4,7 @@ Provides keyword-based search fallback for retrieval enhancement
 """
 import json
 import re
-from typing import List, Dict, Any, Optional
+from typing import Callable, List, Dict, Any, Optional
 from dataclasses import dataclass, field
 from pathlib import Path
 import logging
@@ -49,7 +49,13 @@ class BM25SearchStrategy:
     when vector search fails to retrieve relevant results.
     """
 
-    def __init__(self, metadata_file: str, businesstype: str = "default"):
+    def __init__(
+        self,
+        metadata_file: Optional[str],
+        businesstype: str = "default",
+        documents_provider: Optional[Callable[[], Dict[str, str]]] = None,
+        revision_provider: Optional[Callable[[], int]] = None,
+    ):
         """
         Initialize BM25 search strategy
 
@@ -58,10 +64,13 @@ class BM25SearchStrategy:
             businesstype: Business type for this search instance
         """
         self.businesstype = businesstype
-        self.metadata_file = Path(metadata_file)
+        self.metadata_file = Path(metadata_file) if metadata_file else None
+        self.documents_provider = documents_provider
+        self.revision_provider = revision_provider
+        self._loaded_revision: Optional[int] = None
         self.bm25_index: Optional[BM25Okapi] = None
         self.documents: List[str] = []
-        self.chunk_ids: List[str] = None
+        self.chunk_ids: List[str] = []
         self.id_to_chunk: Dict[str, str] = {}
         self._indexed = False
 
@@ -69,41 +78,72 @@ class BM25SearchStrategy:
             logger.warning(f"[{self.businesstype}] rank-bm25 not available, BM25 search disabled")
             return
 
-        self._load_metadata()
+        self.refresh(force=True)
 
-    def _load_metadata(self) -> None:
-        """Load metadata and build BM25 index"""
-        if not self.metadata_file.exists():
-            logger.warning(f"[{self.businesstype}] Metadata file not found: {self.metadata_file}")
-            return
+    def _load_documents(self) -> Dict[str, str]:
+        """Load the active corpus, preferring the authoritative provider."""
+        if self.documents_provider is not None:
+            return {
+                str(chunk_id): str(text)
+                for chunk_id, text in self.documents_provider().items()
+            }
+
+        if self.metadata_file is None or not self.metadata_file.exists():
+            logger.warning(
+                f"[{self.businesstype}] Metadata file not found: {self.metadata_file}"
+            )
+            return {}
 
         try:
             with open(self.metadata_file, 'r', encoding='utf-8') as f:
                 metadata = json.load(f)
-
-            # Extract documents and chunk IDs
-            self.id_to_chunk = metadata.get('id_to_chunk', {})
-
-            if not self.id_to_chunk:
-                logger.warning(f"[{self.businesstype}] No documents found in metadata")
-                return
-
-            # Prepare documents for BM25 indexing
-            # Each document needs to be tokenized
-            self.chunk_ids = list(self.id_to_chunk.keys())
-            self.documents = [self.id_to_chunk[chunk_id] for chunk_id in self.chunk_ids]
-
-            # Tokenize documents for BM25
-            tokenized_docs = [self._tokenize(doc) for doc in self.documents]
-
-            # Build BM25 index
-            self.bm25_index = BM25Okapi(tokenized_docs)
-            self._indexed = True
-
-            logger.info(f"[{self.businesstype}] BM25 index built with {len(self.documents)} documents")
-
+            return {
+                str(chunk_id): str(text)
+                for chunk_id, text in metadata.get('id_to_chunk', {}).items()
+            }
         except Exception as e:
             logger.error(f"[{self.businesstype}] Failed to load metadata for BM25: {e}")
+            return {}
+
+    def refresh(self, force: bool = False) -> bool:
+        """Rebuild BM25 when the active chunk generation changes."""
+        if not BM25_AVAILABLE:
+            return False
+
+        current_revision = (
+            int(self.revision_provider())
+            if self.revision_provider is not None
+            else None
+        )
+        if (
+            not force
+            and current_revision is not None
+            and current_revision == self._loaded_revision
+        ):
+            return False
+
+        self.id_to_chunk = self._load_documents()
+        self.chunk_ids = list(self.id_to_chunk.keys())
+        self.documents = [self.id_to_chunk[chunk_id] for chunk_id in self.chunk_ids]
+        self._loaded_revision = current_revision
+
+        if not self.documents:
+            self.bm25_index = None
+            self._indexed = False
+            logger.info(f"[{self.businesstype}] BM25 corpus is empty")
+            return True
+
+        try:
+            tokenized_docs = [self._tokenize(doc) for doc in self.documents]
+            self.bm25_index = BM25Okapi(tokenized_docs)
+            self._indexed = True
+            logger.info(f"[{self.businesstype}] BM25 index built with {len(self.documents)} documents")
+            return True
+        except Exception as e:
+            self.bm25_index = None
+            self._indexed = False
+            logger.error(f"[{self.businesstype}] Failed to build BM25 index: {e}")
+            return False
 
     def _tokenize(self, text: str) -> List[str]:
         """
@@ -146,6 +186,8 @@ class BM25SearchStrategy:
             logger.warning(f"[{self.businesstype}] BM25 not available, returning empty results")
             return []
 
+        self.refresh()
+
         if not self._indexed or self.bm25_index is None:
             logger.warning(f"[{self.businesstype}] BM25 index not built")
             return []
@@ -184,6 +226,8 @@ class BM25SearchStrategy:
 
     def is_available(self) -> bool:
         """Check if BM25 search is available"""
+        if BM25_AVAILABLE:
+            self.refresh()
         return BM25_AVAILABLE and self._indexed and self.bm25_index is not None
 
     def get_stats(self) -> Dict[str, Any]:
@@ -193,13 +237,17 @@ class BM25SearchStrategy:
             "available": self.is_available(),
             "document_count": len(self.documents),
             "businesstype": self.businesstype,
-            "metadata_file": str(self.metadata_file)
+            "metadata_source": "provider" if self.documents_provider else "json",
+            "metadata_file": str(self.metadata_file) if self.metadata_file else None,
+            "chunks_revision": self._loaded_revision,
         }
 
 
 def create_bm25_strategy(
-    metadata_file: str,
-    businesstype: str = "default"
+    metadata_file: Optional[str],
+    businesstype: str = "default",
+    documents_provider: Optional[Callable[[], Dict[str, str]]] = None,
+    revision_provider: Optional[Callable[[], int]] = None,
 ) -> Optional[BM25SearchStrategy]:
     """
     Factory function to create BM25 search strategy
@@ -211,7 +259,12 @@ def create_bm25_strategy(
     Returns:
         BM25SearchStrategy instance or None if not available
     """
-    strategy = BM25SearchStrategy(metadata_file, businesstype)
+    strategy = BM25SearchStrategy(
+        metadata_file,
+        businesstype,
+        documents_provider=documents_provider,
+        revision_provider=revision_provider,
+    )
 
     if not strategy.is_available():
         logger.warning(f"[{businesstype}] BM25 strategy not available for use")
